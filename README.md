@@ -69,17 +69,11 @@ see `data_public/DATA_DICTIONARY.md` for column definitions. Participant and ses
 were replaced with fresh, non-linkable IDs, and variables not used in the analyses (e.g., detailed
 demographics, raw neurocognitive subtests) were removed.
 
-The raw imaging and source data are human-subjects data and are **not** shared here; they are
-available subject to the manuscript's Data Availability statement. Image quality control and
-participant exclusions were performed on the raw data and are already reflected in the released
-dataset.
-
 ## Running the code
 
 Open `QSM_Analysis_Submission_public.Rmd` in RStudio and knit it (or run
-`rmarkdown::render("QSM_Analysis_Submission_public.Rmd")`). It loads the included de-identified
-dataset — no filtering or exclusions are applied, as these are already reflected in the released
-data — and reproduces all manuscript figures (`figs/`) and tables (`tables/data/`).
+`rmarkdown::render("QSM_Analysis_Submission_public.Rmd")`). It loads the included
+dataset and reproduces all manuscript figures (`figs/`) and tables (`tables/data/`).
 
 Expected run time: roughly 30–60 minutes on a laptop, dominated by compiling and sampling the
 Bayesian mediation models; the non-Bayesian analyses complete in a few minutes.
