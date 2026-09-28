@@ -1,0 +1,23 @@
+# Human-subjects data — never published
+Data/*.csv
+Data/*.txt
+*.nii
+*.nii.gz
+# Cached fits / large binaries
+Models/
+*.rds
+# knitr/rmarkdown build artifacts
+*_cache/
+*_files/
+*.knit.md
+*.utf8.md
+*.html
+# Office temp + OS cruft
+~$*
+.DS_Store
+.Rhistory
+.Rproj.user/
+
+# ID crosswalk / private re-identification keys — never publish
+*crosswalk*
+PRIVATE_*

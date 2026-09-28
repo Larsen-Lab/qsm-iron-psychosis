@@ -1,0 +1,3534 @@
+---
+title: "QSM Developmental Trajectories and Clinical Correlates"
+author: "Bart Larsen"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    theme: flatly
+    df_print: paged
+---
+
+# Overview
+
+This analysis examines quantitative susceptibility mapping (QSM) data from two longitudinal datasets:
+
+- **EF**: Younger cohort with TD and PS participants
+- **MOTIVE**: Older cohort with TD and PS participants
+
+**Primary Research Questions:**
+
+1. How does susceptibility differ between TD and PS over development in the iron-rich subcortex?
+2. How does susceptibility relate to cognitive performance?
+3. Does QSM mediate the relationship between clinical group and cognitive performance?
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE,
+  message = FALSE,
+  echo = TRUE,
+  fig.width = 10,
+  fig.height = 6,
+  dpi = 300
+)
+
+library(tidyverse)
+library(data.table)
+library(mgcv)
+library(gratia)
+library(broom)
+library(broom.mixed)
+library(lmerTest)
+library(kableExtra)
+library(patchwork)
+library(effectsize)
+library(ggsignif)
+library(ggeffects)
+library(brms)
+library(tidybayes)
+library(ggtext)
+library(scico)
+library(svglite)
+library(gtsummary)
+
+# Pin dplyr verbs after all packages are loaded in case MASS tries to claim them. 
+select <- dplyr::select
+filter <- dplyr::filter
+rename <- dplyr::rename
+
+# Set plot theme
+theme_set(theme_classic(base_size = 14) +
+            theme(
+              text = element_text(size = 14, color = "black"),
+              axis.title = element_text(size = 14, color = "black"),
+              axis.text = element_text(size = 14, color = "black"),
+              plot.title = element_text(size = 14, color = "black"),
+              legend.text = element_text(size = 14, color = "black"),
+              legend.title = element_text(size = 14, color = "black")
+            )
+)
+
+# Source helper functions for GAMM plotting and effects extraction.
+source("R/GAMM_plotting2.R")
+source("R/GAM_Effects.R")
+source("R/partial_residual_plot.R")
+source("R/Feather_Plot.R")
+
+# BRMS mediation settings
+n_brms_iter   <- 4000
+n_brms_warmup <- 1000
+```
+
+# Helper Functions
+
+```{r helper_functions}
+prep_phenotypes <- function(df) {
+  df %>%
+    mutate(
+      subid        = factor(subid),
+      sesid        = factor(sesid),
+      sex          = factor(sex,          levels = c("Male", "Female")),
+      osex         = ordered(sex,         levels = c("Male", "Female")),
+      study.group  = factor(study.group,  levels = c("TD", "PS")),
+      ostudy.group = ordered(study.group, levels = c("TD", "PS")),
+      dataset      = factor(dataset,      levels = c("EF", "MOTIVE")),
+      odataset     = ordered(dataset,     levels = c("EF", "MOTIVE"))
+    )
+}
+
+# Function to present results in a nicely formatted kable table
+present_results <- function(results, highlight_sig = TRUE, sig_level = 0.05) {
+  results %>%
+    mutate(across(where(is.numeric), ~ round(., 3))) %>%
+    kable() %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+    {
+      if (highlight_sig && "p.fdr" %in% names(results))
+        row_spec(., which(results$p.fdr < sig_level), bold = TRUE, color = "red")
+      else .
+    } %>%
+    scroll_box(width = "100%", height = "400px")
+}
+```
+
+# ROI Lists
+
+```{r roi_lists}
+rois <- list(
+  # 1. CIT atlas regions
+  cit_all = c("GPe", "GPi", "NAC", "Ca", "Pu", "VTA","RN","SNr","SNc","PBP","VeP","STH"),
+  
+  # 2. Primary analysis ROI set (consistent across all analyses)
+  # Striatum (Ca, Pu, NAC) + Pallidum_Total + midbrain iron hubs (SN_Total, VTA_Total, RN, STH)
+  primary = c("Ca", "Pu", "NAC", "Pallidum_Total", "SN_Total", "VTA_Total", "RN", "STH"),
+
+  # 3. Functional Groupings (for easy plotting)
+  striatum = c("Ca", "Pu", "NAC"),
+  pallidum = c("GPe", "GPi", "VeP", "Pallidum_Total"),
+  midbrain = c("SN_Total", "VTA_Total", "RN"),
+  basal_ganglia = c("GPe", "GPi", "Ca", "Pu", "NAC"),
+
+  # 4. Global whole subcortex composite
+  global = "Subcortex_Total"
+)
+
+# Conceptual ROI ordering for figures: striatum, pallidum, midbrain
+roi_order_conceptual <- c(rois$striatum, "Pallidum_Total",rois$midbrain, "STH")
+
+# Cognitive measures
+cog_measures <- list(
+  efficiency = c("Overall_Efficiency", "SocialCog_Efficiency", "Memory_Efficiency",
+                 "Executive_Efficiency", "Complex_Efficiency")
+)
+
+# Create display labels for each ROI
+roi_labels <- c(
+  Ca              = "Caudate",
+  Pu              = "Putamen",
+  NAC             = "Nucleus Accumbens",
+  GPe             = "GP (External)",
+  GPi             = "GP (Internal)",
+  VeP             = "Ventral Pallidum",
+  Pallidum_Total  = "Pallidum",
+  SNc             = "SN (compact)",
+  SNr             = "SN (reticular)",
+  SN_Total        = "Substantia Nigra",
+  VTA             = "VTA",
+  PBP             = "Parabrachial Pigm.",
+  VTA_Total       = "VTA",
+  RN              = "Red Nucleus",
+  STH             = "Subthalamic Nucleus",
+  Subcortex_Total = "Global subcortical"
+)
+
+# Create display labels for cognitive variables
+cog_labels <- c(
+  Overall_Efficiency   = "Overall",   
+  SocialCog_Efficiency = "Social",
+  Memory_Efficiency    = "Memory",    
+  Executive_Efficiency = "Executive",
+  Complex_Efficiency   = "Complex",
+  Overall   = "Overall",   
+  SocialCog = "Social",
+  Memory    = "Memory",    
+  Executive = "Executive",
+  Complex   = "Complex"
+)
+
+label_roi <- function(x) { lbl <- roi_labels[x]; ifelse(is.na(lbl), x, unname(lbl)) }
+label_cog <- function(x) { lbl <- cog_labels[x]; ifelse(is.na(lbl), str_remove(x, "_Efficiency"), unname(lbl)) }
+
+# Clinical-group palette to use throughout.
+group_colors <- c("TD" = "#1B9E77", "PS" = "#D55E00")
+group_labels <- c("TD" = "Typically Developing", "PS" = "Psychosis Spectrum")
+
+# Gather relevant model summary statistics into a tidy data frame, including partial eta-squared for smooth terms.
+tidy_gam <- function(model, parametric = FALSE) {
+  out.stats <- broom::tidy(model, parametric = parametric) %>%
+    mutate(N = nrow(model$model)) %>%
+    relocate(N, .after = term)
+  if (!parametric) {
+    # Partial eta-squared: effect-size measure for the smooth-term F-tests,
+    # consistent with the partial η² reported for the QSM smooths in the
+    # iron-cognition models.
+    eta2 <- tryCatch(
+      effectsize::eta_squared(model, partial = TRUE) %>%
+        as.data.frame() %>%
+        dplyr::select(Parameter, partial_eta2 = Eta2_partial),
+      error = function(e) NULL)
+    if (!is.null(eta2)) out.stats <- dplyr::left_join(out.stats, eta2, by = c("term" = "Parameter"))
+  }
+  out.stats
+}
+
+# Significance color + symbol helper (used in Figures 2, 3)
+make_sig_label <- function(pv, pfdr) {
+  if (!is.na(pfdr) && pfdr < 0.05) {
+    list(col = "#d73027", sym = " \\*")
+  } else if (!is.na(pv) && pv < 0.05) {
+    list(col = "grey10", sym = " \u2020")
+  } else {
+    list(col = "grey10", sym = "")
+  }
+}
+
+# Returns list(col, lbl) for use as element_markdown subtitle
+format_sig_label <- function(pv, pfdr = NA, eta2 = NA) {
+  s <- make_sig_label(pv, pfdr)
+  parts <- character(0)
+  if (!is.na(eta2)) parts <- c(parts, paste0("η²<sub>p</sub> = ", formatC(eta2, format = "f", digits = 2)))
+  parts <- c(parts, paste0("*p* = ", formatC(pv, format = "f", digits = 3)))
+  if (!is.na(pfdr)) parts <- c(parts, paste0("*FDR* = ", formatC(pfdr, format = "f", digits = 3)))
+  list(col = s$col, lbl = paste0(paste(parts, collapse = ", "), s$sym))
+}
+
+# Save publication figures as SVG
+save_fig <- function(plot, name, width, height) {
+  ggsave(file.path("figs", paste0(name, ".svg")), plot,
+         width = width, height = height, units = "in", device = svglite)
+  invisible(plot)
+}
+
+# Export table DATA as CSV to tables/data/ (kept separate from the manuscript-ready
+# .docx deliverables in tables/, so re-knitting never muddies the deliverables folder).
+save_table <- function(df, name, caption = NULL) {
+  dir.create(file.path("tables", "data"), showWarnings = FALSE, recursive = TRUE)
+  path <- file.path("tables", "data", paste0(name, ".csv"))
+  write.csv(df, path, row.names = FALSE)
+  if (!is.null(caption)) message(sprintf("Exported: %s - %s", path, caption))
+  invisible(df)
+}
+
+# --- Manuscript regression-table formatters (used for the exported files only;
+# on-screen HTML tables keep their full raw detail). Polished row labels via
+# label_roi / label_cog and consistent, publication-style column names.
+
+# Canonical row ordering for exported tables, matching the figures: whole-subcortex
+# composite first, then striatum -> pallidum -> midbrain; Overall domain first.
+roi_table_order <- c("Subcortex_Total", roi_order_conceptual)
+cog_table_order <- c("Overall_Efficiency", "SocialCog_Efficiency",
+                     "Memory_Efficiency", "Executive_Efficiency", "Complex_Efficiency")
+
+.id_order_key <- function(col, values) {
+  ord <- switch(col, ROI = roi_table_order, Cog.Domain = cog_table_order, NULL)
+  if (is.null(ord)) as.integer(factor(values)) else match(as.character(values), ord)
+}
+
+# Reorder rows by the canonical order of the id column(s), so regions/domains are
+# figure-consistent across every table (rather than p-value ordered).
+.reg_order <- function(df, id_cols) {
+  keys <- lapply(id_cols, function(col) .id_order_key(col, df[[col]]))
+  df[do.call(order, keys), , drop = FALSE]
+}
+
+# Build the polished id column(s) (e.g. Region, or Region + Domain) for a table.
+# id_cols/id_names are character vectors; id_funs a list of labelers (or one function).
+.reg_ids <- function(df, id_cols, id_names, id_funs) {
+  if (is.function(id_funs)) id_funs <- list(id_funs)
+  ids <- Map(function(col, fn) fn(as.character(df[[col]])), id_cols, id_funs)
+  out <- as.data.frame(ids, stringsAsFactors = FALSE, check.names = FALSE)
+  names(out) <- id_names
+  out
+}
+
+# Smooth-term GAMM effects -> [Region/Domain ...] | edf | F | η²p | p | FDR
+reg_table <- function(df, id_cols = "ROI", id_names = "Region", id_funs = list(label_roi)) {
+  df  <- .reg_order(df, id_cols)
+  out <- .reg_ids(df, id_cols, id_names, id_funs)
+  out$edf      <- round(df$edf, 2)
+  out$F        <- round(df$statistic, 2)
+  out[["η²p"]] <- round(df$partial_eta2, 3)
+  out$p        <- signif(df$p.value, 3)
+  if ("p.fdr" %in% names(df)) out$FDR <- signif(df$p.fdr, 3)
+  out
+}
+
+# Parametric contrast (e.g. PS - TD) -> [Region/Domain ...] | β | SE | t | [Cohen's d] | p | FDR
+group_table <- function(df, id_cols = "ROI", id_names = "Region", id_funs = list(label_roi)) {
+  df  <- .reg_order(df, id_cols)
+  out <- .reg_ids(df, id_cols, id_names, id_funs)
+  out[["β"]] <- round(df$estimate, 4)
+  out$SE     <- round(df$std.error, 4)
+  out$t      <- round(df$statistic, 2)
+  if ("cohens_d" %in% names(df)) out[["Cohen's d"]] <- round(df$cohens_d, 3)
+  out$p      <- signif(df$p.value, 3)
+  if ("p.fdr" %in% names(df)) out$FDR <- signif(df$p.fdr, 3)
+  out
+}
+
+# p-value formatter for exported tables ("<0.001" for very small p)
+.fmt_p <- function(p) ifelse(is.na(p), "-", ifelse(p < 0.001, "<0.001", formatC(p, format = "f", digits = 3)))
+
+# --- General combined regression-table plan for the age-family GAMMs -------------
+# tidy_gam_full: one row per model term (smooth terms report edf/F; parametric terms
+# report beta/SE/t), each with partial eta-squared. The random-effect smooth s(subid)
+# and the intercept are dropped. eta_squared keys parametric terms by bare factor
+# name, so each term is matched to its eta by longest-prefix.
+tidy_gam_full <- function(model) {
+  smth <- broom::tidy(model, parametric = FALSE) %>% dplyr::filter(term != "s(subid)") %>%
+    dplyr::transmute(term, estimate = NA_real_, std.error = NA_real_, edf,
+                     stat_type = "F", statistic, p.value)
+  para <- broom::tidy(model, parametric = TRUE)  %>% dplyr::filter(term != "(Intercept)") %>%
+    dplyr::transmute(term, estimate, std.error, edf = NA_real_,
+                     stat_type = "t", statistic, p.value)
+  out <- dplyr::bind_rows(smth, para)
+  eta <- as.data.frame(effectsize::eta_squared(model, partial = TRUE, verbose = FALSE))
+  out$eta2 <- vapply(out$term, function(tm) {
+    hit <- eta$Parameter[eta$Parameter == tm | startsWith(tm, eta$Parameter)]
+    if (!length(hit)) NA_real_ else eta$Eta2_partial[match(hit[which.max(nchar(hit))], eta$Parameter)]
+  }, numeric(1))
+  out$N <- length(model$y)
+  out
+}
+
+# Human labels for model terms (unknown terms fall through unchanged and are dropped
+# by the term_levels filter in reg_supp_table).
+reg_term_labels <- c(
+  "s(age)"                = "Age (smooth)",
+  "s(age):osexFemale"     = "Age x Sex (smooth)",
+  "s(age):ostudy.groupPS" = "Age x Group (smooth)",
+  "sexFemale"             = "Sex (F - M)",
+  "osex.L"                = "Sex (F - M)",
+  "study.groupPS"         = "Group (PS - TD)",
+  "ostudy.group.L"        = "Group (PS - TD)")
+label_term <- function(t) ifelse(is.na(reg_term_labels[t]), t, unname(reg_term_labels[t]))
+
+# reg_supp_table: build one combined regression supplement (grouped by Region) for a
+# set of ROI models + the whole-subcortex composite. FDR is corrected across the
+# primary ROIs within each term; the composite is reference-only (no FDR). Writes a
+# flat CSV (with N) and a grouped Word .docx (N in the footnote); returns the flextable.
+reg_supp_table <- function(models, global_model, name, caption, term_levels) {
+  tidy_set <- function(mods, comp) mods %>%
+    mutate(.t = map(model, tidy_gam_full)) %>% select(ROI, .t) %>% tidyr::unnest(.t) %>%
+    mutate(is_comp = comp)
+  prim <- tidy_set(models, FALSE) %>%
+    group_by(term) %>% mutate(FDR = p.adjust(p.value, "fdr")) %>% ungroup()
+  comp <- tidy_set(global_model, TRUE) %>% mutate(FDR = NA_real_)
+
+  fmt <- bind_rows(prim, comp) %>%
+    mutate(Region = factor(label_roi(as.character(ROI)),
+                           levels = label_roi(c("Subcortex_Total", roi_order_conceptual))),
+           Effect = factor(label_term(term), levels = term_levels)) %>%
+    filter(!is.na(Effect)) %>%
+    arrange(Region, Effect) %>%
+    transmute(
+      Region, Term = as.character(Effect), N,
+      `β (SE)`  = ifelse(is.na(estimate), "", sprintf("%.4f (%.4f)", estimate, std.error)),
+      edf       = ifelse(is.na(edf), "", sprintf("%.2f", edf)),
+      Statistic = sprintf("%s = %.2f", stat_type, statistic),
+      `η²p`     = sprintf("%.3f", eta2),
+      p         = .fmt_p(p.value),
+      FDR       = .fmt_p(FDR))
+
+  save_table(fmt, name, caption)
+  n_obs  <- length(models$model[[1]]$y)
+  n_subj <- dplyr::n_distinct(models$model[[1]]$model$subid)
+  foot <- sprintf(paste0(
+    "N = %d imaging sessions from %d participants for all models. The whole-subcortex composite ",
+    "is shown for reference and is not part of the FDR correction."),
+    n_obs, n_subj)
+  # Word table: Region as a bold first column (name on each block's first row only,
+  # blank below) with clean block separators. Avoids vertical-merge render artifacts.
+  body   <- dplyr::select(fmt, -N)
+  bounds <- cumsum(rle(as.character(body$Region))$lengths)
+  first  <- c(1, head(bounds, -1) + 1)
+  body$Region <- ifelse(seq_len(nrow(body)) %in% first, as.character(body$Region), "")
+  bd <- officer::fp_border(color = "grey55", width = 1)
+  ft <- flextable::flextable(body) %>%
+    flextable::border_remove() %>%
+    flextable::bold(j = "Region", part = "body") %>%
+    flextable::bold(part = "header") %>%
+    flextable::hline_top(part = "header", border = bd) %>%
+    flextable::hline_bottom(part = "header", border = bd) %>%
+    flextable::hline(i = bounds, part = "body", border = bd) %>%
+    flextable::add_footer_lines(foot) %>%
+    flextable::fontsize(size = 8, part = "footer") %>%
+    flextable::autofit()
+  # Final APA .docx tables are built separately; this flextable is for the HTML preview only.
+  ft
+}
+```
+
+# Data Loading and Preparation
+
+## Load de-identified public data
+
+This public version loads the released de-identified analysis dataset
+(`data_public/qsm_iron_psychosis_analysis_data.csv`) in place of the raw source files and the
+image-processing / quality-control pipeline used in the primary analysis. The released data are
+the final analytic sample (263 sessions from 183 participants), with image quality control and
+all participant exclusions already applied, so no filtering is performed here. This version
+reproduces all reported statistical analyses, tables, and figures.
+
+```{r load_public_data}
+# Output directories for saved figures/tables (created on a fresh clone).
+dir.create("figs", showWarnings = FALSE)
+dir.create(file.path("tables", "data"), recursive = TRUE, showWarnings = FALSE)
+
+pub <- readr::read_csv("data_public/qsm_iron_psychosis_analysis_data.csv", show_col_types = FALSE)
+
+med_cols <- c("med_any_psych", "med_stimulant", "med_antidepressant", "med_any_ap",
+              "med_mood_stab", "med_anxiolytic", "iron_supplement")
+
+# Analysis dataframe: map released IDs to the internal names the downstream code expects,
+# add a subject key (bblid = participant id for the public release), and drop the medication
+# columns here (re-attached downstream via `med_harmonized`, mirroring the original join).
+df <- pub %>%
+  dplyr::rename(subid = participant_id, sesid = session) %>%
+  dplyr::mutate(bblid = subid) %>%
+  dplyr::select(-dplyr::all_of(med_cols)) %>%
+  prep_phenotypes()
+
+# Subject-level harmonized medication frame (one row per participant), matching the object the
+# Table 1 and medication-sensitivity chunks expect (they join it on `bblid`).
+med_harmonized <- pub %>%
+  dplyr::transmute(bblid = participant_id, dataset,
+                   dplyr::across(dplyr::all_of(med_cols))) %>%
+  dplyr::distinct(bblid, .keep_all = TRUE)
+
+cat(sprintf("Loaded public data: %d sessions, %d participants (PS %d / TD %d)\n",
+            nrow(df), dplyr::n_distinct(df$subid),
+            dplyr::n_distinct(df$subid[df$study.group == "PS"]),
+            dplyr::n_distinct(df$subid[df$study.group == "TD"])))
+```
+
+# Sample Characteristics
+
+```{r sample_characteristics}
+# Med-class flags shown in Table 1 (combined EF + MOTIVE, harmonized subject-level)
+med_tab_vars <- c("Any psychotropic", "Stimulant", "Antidepressant",
+                  "Antipsychotic", "Mood stabilizer", "Anxiolytic", "Iron supplement")
+
+# Collapse to one row per subject (first/baseline visit) for demographics, then
+# attach harmonized medication flags (any use across visits) keyed on bblid.
+df_subj <- df %>%
+  group_by(subid) %>%
+  arrange(age) %>%
+  summarise(
+    bblid        = first(bblid),
+    Group        = first(study.group),
+    Dataset      = factor(first(dataset)),
+    Sex          = first(sex),
+    Age_Baseline = first(age),
+    Age_Mean     = mean(age, na.rm = TRUE),
+    N_Visits     = n(),
+    .groups      = "drop"
+  ) %>%
+  left_join(
+    med_harmonized %>%
+      distinct(bblid, .keep_all = TRUE) %>%
+      transmute(
+        bblid,
+        `Any psychotropic` = med_any_psych,
+        `Stimulant`        = med_stimulant,
+        `Antidepressant`   = med_antidepressant,
+        `Antipsychotic`    = med_any_ap,
+        `Mood stabilizer`  = med_mood_stab,
+        `Anxiolytic`       = med_anxiolytic,
+        `Iron supplement`  = iron_supplement
+      ),
+    by = "bblid"
+  ) %>%
+  mutate(across(all_of(med_tab_vars),
+                ~ factor(.x, levels = c(0, 1), labels = c("No", "Yes"))))
+
+# Table 1: demographics + medication use by clinical group, with significance tests.
+# Medications were harmonized across cohorts and endorsed almost exclusively by PS.
+tbl1 <- tbl_summary(
+  df_subj,
+  by       = Group,
+  include  = c(Sex, Age_Baseline, Age_Mean, N_Visits, all_of(med_tab_vars)),
+  label    = list(
+    Sex          ~ "Sex",
+    Age_Baseline ~ "Age at first visit (years)",
+    Age_Mean     ~ "Mean age across visits (years)",
+    N_Visits     ~ "Number of visits"
+  ),
+  type      = all_of(med_tab_vars) ~ "dichotomous",
+  value     = all_of(med_tab_vars) ~ "Yes",
+  statistic = list(
+    all_continuous()  ~ "{mean} ({sd}); [{min}-{max}]",
+    all_categorical() ~ "{n} ({p}%)"
+  ),
+  digits  = list(all_continuous() ~ 1),
+  missing = "no"
+) %>%
+  add_p(
+    test = list(
+      Age_Baseline ~ "wilcox.test",
+      Age_Mean     ~ "wilcox.test",
+      N_Visits     ~ "wilcox.test",
+      Sex          ~ "fisher.test",
+      all_of(med_tab_vars) ~ "fisher.test"
+    ),
+    pvalue_fun = ~ style_pvalue(.x, digits = 3)
+  ) %>%
+  add_overall(col_label = "**Overall\nN = {N}**") %>%
+  modify_header(label ~ "**Characteristic**") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Clinical Group**") %>%
+  bold_labels() %>%
+  modify_caption("**Table 1. Sample Characteristics**") %>%
+  modify_footnote(all_stat_cols() ~
+    "Medication classes are harmonized across the EF and MOTIVE cohorts (any use across visits).")
+tbl1
+# Table 1 deliverable is the hand-formatted Table_1_Sample_Characteristics_v2.docx;
+# no auto-export here (it previously wrote a stale Helvetica table1_demographics.docx).
+
+# Age distribution by dataset, sex, and group
+ggplot(df, aes(x = age, fill = study.group)) +
+  geom_density(alpha = 0.75, position = "identity") +
+  facet_grid(~sex) +
+  scale_fill_manual(values = group_colors,
+                    labels = c("TD" = "Typically Developing", "PS" = "Psychosis Spectrum")) +
+  labs(
+    title = "Age Distribution by Dataset, Sex, and Clinical Group",
+    x    = "Age (years)",
+    y    = "Density",
+    fill = NULL
+  ) +
+  theme(
+    legend.position  = "bottom",
+    strip.background = element_blank()
+  )
+
+```
+
+# Figure 1
+
+```{r figure_1, fig.width=6, fig.height=5, dpi=300}
+fig1 <- feather_plot(df,
+             id.col       = "subid",
+             color.col    = "study.group",
+             shape.col    = "sex",
+             color.values = group_colors,
+             color.labels = c(TD = "Typically Developing", PS = "Psychosis Spectrum"),
+             shape.values = c(Male = 19, Female = 17))
+fig1
+save_fig(fig1, "fig1_feather", width = 6, height = 5)
+```
+
+
+
+```{r qsm_composites}
+# Only use composites that were pre-computed with proper voxel-count weighting.
+# Subcortex_Total comes from the atlas mask aggregate (ROI_Stats_CIT_Valid_Regions_Mask.csv).
+# Simple ROI averages (e.g., striatum mean) are not valid without voxel counts.
+rois$composites <- "Subcortex_Total"
+cat("Composite ROI: Subcortex_Total (voxel-weighted whole-subcortex average)\n")
+```
+
+```{r df_checkpoint, cache=TRUE, cache.extra=digest::digest(df)}
+# Clear cache if df has changed.
+# Every model-fitting chunk uses dependson = "df_checkpoint" so they
+# automatically re-run when outlier flagging or any other data prep changes df.
+invisible(NULL)
+```
+
+# Fit developmental models
+## Global composite models
+```{r global_composite_models, cache=TRUE, dependson="df_checkpoint"}
+# Fit global subcortex models for all major analyses - outputs are used as needed downstream.
+# All models share a common GAMM structure for consistency and comparability of age effects:
+# - Penalized thin-plate regression spline for age to capture nonlinear developmental trajectories while penalizing overfitting.
+# - Random intercept for subid to account for repeated measures nested within subject.
+
+
+# 1. Age + group main effects (also used for group differences)
+global_comp_age_models <- df %>%
+  filter(!is.na(age)) %>%
+  pivot_longer(cols = rois$global, names_to = "ROI", values_to = "QSM") %>%
+  filter(!is.na(QSM)) %>%
+  group_by(ROI) %>%
+  summarise(
+    model = list(tryCatch({
+      d <- cur_data()
+      mgcv::gam(QSM ~ s(age, k = 6) + sex + study.group + s(subid, bs = "re"),
+          method = "REML", data = d)
+    }, error = function(e) NULL)),
+    .groups = "drop"
+  )
+
+# 2. Age x sex interaction
+global_comp_agesex_models <- df %>%
+  filter(!is.na(age)) %>%
+  pivot_longer(cols = rois$global, names_to = "ROI", values_to = "QSM") %>%
+  filter(!is.na(QSM)) %>%
+  group_by(ROI) %>%
+  summarise(
+    model = list(tryCatch({
+      d <- cur_data()
+      mgcv::gam(QSM ~ s(age, k = 6) + s(age, by = osex, k = 4) + osex + study.group + s(subid, bs = "re"),
+          method = "REML", data = d)
+    }, error = function(e) NULL)),
+    .groups = "drop"
+  )
+
+# 3. Age x group interaction
+global_comp_agegroup_models <- df %>%
+  filter(!is.na(age)) %>%
+  pivot_longer(cols = rois$global, names_to = "ROI", values_to = "QSM") %>%
+  filter(!is.na(QSM)) %>%
+  group_by(ROI) %>%
+  summarise(
+    model = list(tryCatch({
+      d <- cur_data()
+      mgcv::gam(QSM ~ s(age, k = 6) + s(age, by = ostudy.group, k = 4) + osex + ostudy.group + s(subid, bs = "re"),
+          method = "REML", data = d)
+    }, error = function(e) NULL)),
+    .groups = "drop"
+  )
+```
+
+## Sub-region models
+```{r roi_models, cache=TRUE, dependson="df_checkpoint"}
+# Fit ROI-wise models for all major analyses using the same workflow as the global composites above. Outputs are used as needed downstream.
+
+df_long <- df %>%
+  pivot_longer(cols = all_of(rois$primary), names_to = "ROI", values_to = "QSM")
+
+# 1. Age + group main effects (also used for group differences)
+age_main_models <- df_long %>%
+  filter(!is.na(age), !is.na(QSM)) %>%
+  group_by(ROI) %>%
+  summarise(model = list(tryCatch(
+    mgcv::gam(QSM ~ s(age) + sex + study.group + s(subid, bs = "re"),
+              method = "REML", data = cur_data()),
+    error = function(e) NULL)), .groups = "drop") %>%
+  filter(!map_lgl(model, is.null))
+
+# 2. Age x sex interaction
+age_sex_models <- df_long %>%
+  filter(!is.na(age), !is.na(QSM)) %>%
+  group_by(ROI) %>%
+  summarise(model = list(tryCatch(
+    mgcv::gam(QSM ~ s(age, k = 6) + s(age, by = osex, k = 4) + osex + study.group + s(subid, bs = "re"),
+              method = "REML", data = cur_data()),
+    error = function(e) NULL)), .groups = "drop") %>%
+  filter(!map_lgl(model, is.null))
+
+# 3. Age x group interaction
+age_group_ps_models <- df_long %>%
+  filter(!is.na(age), !is.na(QSM)) %>%
+  group_by(ROI) %>%
+  summarise(model = list(tryCatch(
+    mgcv::gam(QSM ~ s(age, k = 6) + s(age, by = ostudy.group, k = 4) + osex + ostudy.group + s(subid, bs = "re"),
+              method = "REML", data = cur_data()),
+    error = function(e) NULL)), .groups = "drop") %>%
+  filter(!map_lgl(model, is.null))
+```
+
+# Regression Tables (Supplementary)
+
+Consolidated regression readouts for the three age-family models (one row-block per region). For
+each model we report every term: the age smooth and any interaction smooth with edf and F, plus the
+parametric sex and group effects with beta (SE) and t, each with partial eta-squared. FDR is
+corrected across the primary ROI set within each term; the whole-subcortex composite is shown for
+reference (not part of the FDR family).
+
+```{r regression_supp_tables}
+.sc <- function(m) m %>% filter(ROI == "Subcortex_Total")
+
+# 1. Age model: QSM ~ s(age) + sex + group
+reg_supp_table(age_main_models, .sc(global_comp_age_models),
+  "supptable_age_model_regression", "Supp Table: age model (age + sex + group) by ROI",
+  c("Age (smooth)", "Sex (F - M)", "Group (PS - TD)"))
+
+# 2. Age x sex model: QSM ~ s(age) + s(age, by = sex) + sex + group
+reg_supp_table(age_sex_models, .sc(global_comp_agesex_models),
+  "supptable_agesex_model_regression", "Supp Table: age x sex model by ROI",
+  c("Age (smooth)", "Age x Sex (smooth)", "Sex (F - M)", "Group (PS - TD)"))
+
+# 3. Age x group model: QSM ~ s(age) + s(age, by = group) + sex + group
+reg_supp_table(age_group_ps_models, .sc(global_comp_agegroup_models),
+  "supptable_agegroup_model_regression", "Supp Table: age x group model by ROI",
+  c("Age (smooth)", "Age x Group (smooth)", "Sex (F - M)", "Group (PS - TD)"))
+```
+
+
+# Reporting
+# Age Effects
+
+All analyses use **TD vs PS**, pooled across EF and MOTIVE. No cohort covariate is included since sensitivity analyses confirmed no significant dataset main effect across any ROI (all p > 0.25). 
+
+All models use a GAMM structure with a penalized thin-plate regression spline (mgcv default) for age and a random intercept for subid to account for repeated measures. This allows us to flexibly capture non-linear developmental trajectories without overfitting, while properly modeling the longitudinal data structure.
+
+## Global
+
+```{r global_age_composites}
+global_age_comp_results <- global_comp_age_models %>%
+  mutate(tidy = map(model, tidy_gam)) %>%
+  select(-model) %>%
+  unnest(tidy) %>%
+  filter(term == "s(age)") %>%
+  mutate(across(where(is.numeric), ~ round(., 4)))
+
+global_age_comp_results %>%
+  select(ROI, edf, F = statistic, partial_eta2, p.value) %>%
+  kable(caption = "Age effect - global composite") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed")) %>%
+  row_spec(which(global_age_comp_results$p.value < 0.05), bold = TRUE, color = "darkred")
+
+sig_age_comp <- global_age_comp_results %>% filter(p.value < 0.05) %>% pull(ROI)
+if (length(sig_age_comp) > 0) {
+  plots <- map(sig_age_comp, ~ partial_resid_plot(
+    global_comp_age_models %>% filter(ROI == .x) %>% pull(model) %>% .[[1]],
+    term = "age", group.term = "subid", plot.title = label_roi(.x),
+    xlabel = "Age (years)", ylabel = "Susceptibility (ppm)",
+    show.data = TRUE, add.intercept = TRUE
+  ))
+  wrap_plots(plots, ncol = min(3, length(plots)))
+}
+```
+
+## Region-wise
+
+```{r age_effects_tdps, cache=TRUE, dependson="roi_models", fig.width=12, fig.height=8}
+age_main_results <- age_main_models %>%
+  mutate(tidy = map(model, tidy_gam)) %>%
+  select(-model) %>%
+  unnest(tidy) %>%
+  filter(term == "s(age)") %>%
+  mutate(p.fdr = p.adjust(p.value, "fdr")) %>%
+  arrange(p.value)
+
+# Age effects are exported in the consolidated age-model regression supplement below.
+age_main_results %>%
+  present_results()
+
+top_rois <- age_main_results %>%
+  slice_head(n = 9) %>%
+  pull(ROI)
+
+plots <- age_main_models %>%
+  filter(ROI %in% top_rois) %>%
+  arrange(ROI) %>%
+  mutate(plot = map2(model, ROI, ~ partial_resid_plot(
+    .x, term = "age", group.term = "subid", plot.title = label_roi(.y),
+    xlabel = "Age (years)", ylabel = "Susceptibility (ppm)",
+    show.data = TRUE, add.intercept = TRUE))) %>%
+  pull(plot)
+
+wrap_plots(plots, ncol = 3)
+
+```
+
+## Age x Sex
+
+### Global
+
+```{r global_agesex_composites}
+global_agesex_comp_results <- global_comp_agesex_models %>%
+  filter(!map_lgl(model, is.null)) %>%
+  mutate(
+    tidy = map(model, ~ tidy_gam(.x) %>%
+                 filter(str_detect(term, "s\\(age\\):osex")))
+  ) %>%
+  select(-model) %>%
+  unnest(tidy) %>%
+  mutate(across(where(is.numeric), ~ round(., 4)))
+
+global_agesex_comp_results %>%
+  select(ROI, edf, F = statistic, partial_eta2, p.value) %>%
+  kable(caption = "Age x sex interaction - global composite") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed")) %>%
+  row_spec(which(global_agesex_comp_results$p.value < 0.05), bold = TRUE, color = "darkred")
+
+sig_agesex_comp <- global_agesex_comp_results %>% filter(p.value < 0.05) %>% pull(ROI)
+if (length(sig_agesex_comp) > 0) {
+  plots <- map(sig_agesex_comp, ~ partial_resid_plot(
+    global_comp_agesex_models %>% filter(ROI == .x) %>% pull(model) %>% .[[1]],
+    term = "age", int.term = "osex", group.term = "subid", plot.title = label_roi(.x),
+    xlabel = "Age (years)", ylabel = "Susceptibility (ppm)",
+    show.data = TRUE, add.intercept = TRUE
+  ))
+  wrap_plots(plots, ncol = min(3, length(plots)))
+}
+rm(global_comp_agesex_models)
+```
+
+### Region-wise
+
+```{r age_by_sex, cache=TRUE, dependson="roi_models"}
+age_sex_results <- age_sex_models %>%
+  mutate(tidy = map(model, tidy_gam)) %>%
+  select(-model) %>%
+  unnest(tidy) %>%
+  filter(str_detect(term, "s\\(age\\):osex")) %>%
+  mutate(p.fdr = p.adjust(p.value, "fdr")) %>%
+  arrange(p.value)
+
+# Age x sex results are exported in the consolidated regression supplement (age x sex model).
+
+age_sex_results %>%
+  present_results()
+```
+
+# Group Differences
+
+## Global
+
+```{r global_grpdiff_composites}
+# Reuses global_comp_age_models (QSM ~ s(age) + sex + study.group)
+global_grpdiff_comp_results <- global_comp_age_models %>%
+  filter(!map_lgl(model, is.null)) %>%
+  mutate(
+    tidy = map(model, ~ {
+      n_grp    <- distinct(.x$model, subid, study.group) %>% count(study.group)
+      n_td     <- n_grp$n[n_grp$study.group == "TD"]
+      n_ps     <- n_grp$n[n_grp$study.group == "PS"]
+      resid_df <- .x$df.residual
+      broom::tidy(.x, parametric = TRUE) %>%
+        filter(str_detect(term, "study.groupPS")) %>%
+        mutate(
+          cohens_d       = statistic * sqrt(1 / n_td + 1 / n_ps),
+          partial_omega2 = pmax(0, (statistic^2 - 1) / (statistic^2 + resid_df))
+        )
+    })
+  ) %>%
+  select(-model) %>%
+  unnest(tidy) %>%
+  mutate(across(where(is.numeric), ~ round(., 4)),
+         p.fdr = p.adjust(p.value, "fdr"))
+
+global_grpdiff_comp_results %>%
+  mutate(across(where(is.numeric), ~ round(., 4))) %>%
+  kable(caption = "TD vs PS group differences - global composites") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed")) %>%
+  row_spec(which(global_grpdiff_comp_results$p.value < 0.05), bold = TRUE, color = "darkred")
+
+# --- Global Plot Prep ---
+sub_mod_gam <- global_comp_age_models %>% filter(ROI == "Subcortex_Total") %>% pull(model) %>% .[[1]]
+
+pred_sub <- predict_response(sub_mod_gam, terms = "study.group", margin = "empirical") %>% 
+  as.data.frame()
+
+stats_row <- global_grpdiff_comp_results %>% filter(ROI == "Subcortex_Total")
+sig_label <- sprintf("italic(d) == %.2f * ',' ~ italic(p) == %.3f", 
+                     stats_row$cohens_d, stats_row$p.value)
+
+# --- Global Plot ---
+p_global <- ggplot(pred_sub, aes(x = x, y = predicted, fill = x)) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.1, color = "grey30", linewidth = 0.8) +
+  geom_point(shape = 21, size = 4, color = "grey30", stroke = 1) +
+  geom_signif(
+    comparisons = list(c("TD", "PS")),
+    annotations = sig_label,
+    parse = TRUE,
+    y_position = max(pred_sub$conf.high) * 1.05, 
+    tip_length = 0.02,
+    vjust = -0.2,
+    textsize = 3.5
+  ) +
+  scale_fill_manual(values = group_colors,
+                    labels = c("TD" = "Typically Developing", "PS" = "Psychosis Spectrum")) +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.15))) +
+  labs(title = "Global subcortical", y = "Adjusted Susceptibility (ppm)", x = NULL, fill = NULL) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+## Region-wise
+
+```{r group_differences_tdps}
+group_diff_tdps_results <- age_main_models %>%
+  mutate(
+    tidy = map(model, ~ {
+      mod_gam  <- .x
+      resid_df <- mod_gam$df.residual
+      n_grp    <- distinct(mod_gam$model, subid, study.group) %>% count(study.group)
+      n_td     <- n_grp$n[n_grp$study.group == "TD"]
+      n_ps     <- n_grp$n[n_grp$study.group == "PS"]
+
+      broom::tidy(mod_gam, parametric = TRUE) %>%
+        mutate(
+          partial_omega2 = pmax(0, (statistic^2 - 1) / (statistic^2 + resid_df)),
+          cohens_d = if_else(
+            str_detect(term, "study.group"),
+            statistic * sqrt(1 / n_td + 1 / n_ps),
+            NA_real_
+          )
+        )
+    })
+  ) %>%
+  select(-model) %>%
+  unnest(tidy) %>%
+  filter(str_detect(term, "study.group")) %>%
+  mutate(p.fdr = p.adjust(p.value, "fdr")) %>%
+  arrange(p.value)
+
+# Group differences are exported in the consolidated age-model regression supplement.
+group_diff_tdps_results %>%
+  present_results()
+
+# --- ROI-wise predictions: same ggeffects pipeline as global ---
+ps.means <- age_main_models %>%
+  mutate(
+    preds = map(model, ~ {
+      predict_response(.x, terms = "study.group", margin = "empirical") %>%
+        as.data.frame() %>%
+        rename(study.group = x, QSM_mean = predicted,
+               QSM_lower = conf.low, QSM_upper = conf.high)
+    })
+  ) %>%
+  select(-model) %>%
+  unnest(preds)
+
+ps.means_sig <- ps.means %>%
+  left_join(
+    group_diff_tdps_results %>%
+      select(ROI, grp_p = p.value, grp_fdr = p.fdr, cohens_d),
+    by = "ROI"
+  ) %>%
+  mutate(
+    sig_label = case_when(grp_fdr < 0.05 ~ "**", grp_p < 0.05 ~ "*", TRUE ~ ""),
+    ROI = factor(ROI, levels = roi_order_conceptual)
+  ) %>%
+  filter(!is.na(ROI))
+
+# Per-ROI annotation: d and significance, placed above the higher CI
+roi_annot <- ps.means_sig %>%
+  group_by(ROI, grp_p, grp_fdr, cohens_d, sig_label) %>%
+  summarise(y_top = max(QSM_upper), .groups = "drop") %>%
+  mutate(
+    label = sprintf("italic(d)==%.2f%s",
+                    cohens_d,
+                    ifelse(sig_label != "", paste0("~'", sig_label, "'"), ""))
+  )
+
+p_roi <- ggplot(ps.means_sig, aes(x = ROI, y = QSM_mean, fill = study.group)) +
+  geom_errorbar(aes(ymin = QSM_lower, ymax = QSM_upper),
+                position = position_dodge(width = 0.6),
+                width = 0.1, color = "grey30", linewidth = 0.8) +
+  geom_point(shape = 21, size = 4, color = "grey30", stroke = 1,
+             position = position_dodge(width = 0.6)) +
+  geom_text(data = roi_annot,
+            aes(x = ROI, y = y_top, label = label),
+            inherit.aes = FALSE, parse = TRUE,
+            vjust = -0.4, size = 2.8, color = "grey20") +
+  scale_fill_manual(values = group_colors,
+                    labels = c("TD" = "Typically Developing", "PS" = "Psychosis Spectrum")) +
+  scale_x_discrete(labels = roi_labels) +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.15))) +
+  labs(x = NULL, y = "Adjusted Susceptibility (ppm)", fill = NULL) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1),
+        legend.position = "none")
+
+# Combine: collect shared legend at bottom
+final_fig <- (p_global + p_roi +
+  plot_layout(widths = c(1, 2.5), guides = "collect")) +
+  plot_annotation(
+    title = "TD vs. Psychosis Spectrum: Age-Adjusted Subcortical Iron",
+    tag_levels = "A",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 12),
+      plot.tag   = element_text(face = "bold")
+    )
+  ) &
+  theme(legend.position = "bottom")
+
+print(final_fig)
+# global_comp_age_models + age_main_models are kept alive for the regional
+# overview figure (developmental trajectories) at the end of this block.
+rm(final_fig, p_global, p_roi, ps.means, ps.means_sig, roi_annot)
+```
+
+# Age x Group Interactions
+
+Global test using the whole-subcortex composite (`Subcortex_Total`) before ROI-wise
+follow-up.
+
+## Global
+
+```{r age_group_global_test}
+global_agegroup_comp_results <- global_comp_agegroup_models %>%
+  filter(!map_lgl(model, is.null)) %>%
+  mutate(
+    tidy = map(model, ~ tidy_gam(.x) %>%
+                 filter(str_detect(term, "ostudy.groupPS")))
+  ) %>%
+  select(-model) %>%
+  unnest(tidy) %>%
+  mutate(across(where(is.numeric), ~ round(., 4)))
+
+global_agegroup_comp_results %>%
+  select(ROI, edf, F = statistic, partial_eta2, p.value) %>%
+  kable(caption = "Age by group interaction - global composite") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed")) %>%
+  row_spec(which(global_agegroup_comp_results$p.value < 0.05), bold = TRUE, color = "darkred")
+
+sig_agegroup_comp <- global_agegroup_comp_results %>% filter(p.value < 0.05) %>% pull(ROI)
+if (length(sig_agegroup_comp) > 0) {
+  cat(sprintf("-> Significant age by group in: %s - proceeding to ROI-wise follow-up.\n",
+              paste(sig_agegroup_comp, collapse = ", ")))
+  plots <- map(sig_agegroup_comp, ~ partial_resid_plot(
+    global_comp_agegroup_models %>% filter(ROI == .x) %>% pull(model) %>% .[[1]],
+    term = "age", int.term = "ostudy.group",
+    group.term = "subid", plot.title = .x,
+    xlabel = "Age (years)", ylabel = paste(.x, "(ppm)"),
+    show.data = TRUE, add.intercept = TRUE
+  ) +
+    scale_color_manual(values = group_colors, name = "Group") +
+    scale_fill_manual(values  = group_colors, name = "Group"))
+  wrap_plots(plots, ncol = min(3, length(plots)), guides = "collect") &
+    theme(legend.position = "bottom")
+} else {
+  cat("-> No significant age by group in global composites (p > 0.05).\n")
+}
+```
+
+## Region-wise
+
+```{r age_by_group, cache=TRUE, dependson="roi_models", fig.height=8, fig.width=15}
+age_group_ps_results <- age_group_ps_models %>%
+  mutate(tidy = map(model, tidy_gam)) %>%
+  select(-model) %>%
+  unnest(tidy) %>%
+  filter(term == "s(age):ostudy.groupPS") %>%
+  mutate(p.fdr = p.adjust(p.value, "fdr")) %>%
+  arrange(p.value)
+
+# Age x group results are exported in the consolidated regression supplement (age x group model).
+
+age_group_ps_results %>%
+  present_results()
+
+sig_rois <- age_group_ps_results %>%
+  filter(p.fdr < 0.05) %>%
+  pull(ROI)
+
+if (length(sig_rois) > 0) {
+  plots <- age_group_ps_models %>%
+    filter(ROI %in% sig_rois) %>%
+    arrange(ROI) %>%
+    mutate(plot = map2(model, ROI,
+                       ~ partial_resid_plot(
+                         .x, term = "age", int.term = "ostudy.group",
+                         group.term = "subid", plot.title = label_roi(.y),
+                         xlabel = "Age (years)", ylabel = "Susceptibility (ppm)",
+                         show.data = TRUE, add.intercept = TRUE))) %>%
+    pull(plot)
+
+  print(
+    wrap_plots(plots, ncol = 4) +
+      plot_layout(guides = "collect") +
+      plot_annotation(
+        title    = "Age by Group (TD vs. PS)",
+      ) &
+      theme(legend.position = "bottom")
+  )
+} else {
+  cat("No significant age x group interactions at FDR < 0.05\n")
+}
+```
+
+
+### Divergence Onset: Computation
+
+Using the ordered-factor difference smooth `s(age):ostudy.groupPS`, we ask two
+complementary questions at each ROI:
+
+1. **Derivative onset** - at what age does the *rate* of TD-PS divergence first
+   become credibly non-zero? This captures when the "insult" begins.
+2. **Level onset** - at what age has enough divergence *accumulated* for the
+   overall TD-PS gap to become credibly non-zero?
+
+Both use simultaneous 95 % confidence intervals across the full age range (not
+pointwise), so the family-wise error rate is controlled.
+
+```{r age_group_divergence, cache=TRUE, dependson="age_by_group"}
+smooth_label <- "s(age):ostudy.groupPS"
+
+# Compute total TD-PS difference (parametric offset + age-varying smooth)
+# using the lpmatrix difference: Xp(PS) - Xp(TD) cancels all shared terms
+compute_divergence <- function(mod, roi_name, n_pts = 200, n_sim = 10000) {
+
+  # Trim to 1st-99th percentile of observed ages to avoid boundary instability
+  age_range  <- quantile(mod$model$age, c(0.01, 0.99))
+  age_seq    <- seq(age_range[1], age_range[2], length.out = n_pts)
+  grp_levels <- levels(mod$model$ostudy.group)
+
+  # Prediction grids - identical except for group
+  base <- data.frame(age = age_seq, osex = mod$model$osex[1],
+                     subid = mod$model$subid[1])
+  nd_PS <- cbind(base, ostudy.group = ordered("PS", levels = grp_levels))
+  nd_TD <- cbind(base, ostudy.group = ordered("TD", levels = grp_levels))
+
+  # Difference in lpmatrices - shared terms cancel, only group columns survive
+  Xp_diff <- predict(mod, nd_PS, type = "lpmatrix") -
+             predict(mod, nd_TD, type = "lpmatrix")
+
+  beta <- coef(mod)
+  Vp   <- vcov(mod, unconditional = TRUE)
+
+  # --- Point estimates ---
+  total_diff <- as.numeric(Xp_diff %*% beta)
+  total_se   <- sqrt(rowSums((Xp_diff %*% Vp) * Xp_diff))
+
+  # Simultaneous CI (simulation-based critical value)
+  sim0    <- MASS::mvrnorm(n_sim, mu = rep(0, length(beta)), Sigma = Vp) #simulate from multivariate normal distrubition
+  sim_dev <- Xp_diff %*% t(sim0)# n_pts x n_sim
+  sim_std <- sweep(sim_dev, 1, total_se, "/")
+  crit_val <- quantile(apply(abs(sim_std), 2, max), 0.95)
+
+  sm <- tibble(age = age_seq, .estimate = total_diff, .se = total_se,
+               .lower_ci = total_diff - crit_val * total_se,
+               .upper_ci = total_diff + crit_val * total_se,
+               ROI = roi_name)
+
+  # Level onset (simultaneous CI excludes zero)
+  level_sig   <- sm %>% filter(.lower_ci > 0 | .upper_ci < 0)
+  level_onset <- if (nrow(level_sig) > 0) min(level_sig$age) else NA_real_
+
+  # Derivative onset (smooth-only - parametric derivative = 0)
+  deriv <- derivatives(mod, select = smooth_label, n = n_pts,
+                       unconditional = TRUE, interval = "simultaneous")
+  deriv$ROI <- roi_name
+  deriv_sig   <- deriv %>% filter(.lower_ci > 0 | .upper_ci < 0)
+  deriv_onset <- if (nrow(deriv_sig) > 0) min(deriv_sig$age) else NA_real_
+
+  # Meaningful difference thresholds: Cohen's d > .1 or .2 
+  grp_var <- mod$model$ostudy.group
+  qsm_response <- model.response(mod$model)
+  grp_sds <- tapply(qsm_response, grp_var, sd, na.rm = TRUE)
+  grp_ns  <- tapply(qsm_response, grp_var, length)
+  pooled_sd <- sqrt(sum((grp_ns - 1) * grp_sds^2) / sum(grp_ns - 1))
+  rope_d1  <- 0.1 * pooled_sd   # d = 0.1 (low threshold/very small effect)
+  rope_d2  <- 0.2 * pooled_sd   # d = 0.2 (small effect threshold)
+
+  # --- Posterior onset distributions ---
+  beta_draws  <- MASS::mvrnorm(n_sim, mu = beta, Sigma = Vp)
+  post_curves <- Xp_diff %*% t(beta_draws)
+  effect_dir  <- sign(total_diff[n_pts]) # expected direction
+
+  # Find the age of permanent group diffs beyond a given cohen's d threshold
+  find_onset <- function(curve, thresh) {
+    directed <- curve * effect_dir
+    below <- which(directed <= thresh)
+    if (length(below) == 0) return(age_seq[1])
+    last_below <- max(below)
+    if (last_below >= n_pts) return(NA_real_)
+    age_seq[last_below + 1]
+  }
+
+  # Level onset per draw at both ROPE thresholds
+  post_onset_d1 <- apply(post_curves, 2, find_onset, thresh = rope_d1)
+  post_onset_d2 <- apply(post_curves, 2, find_onset, thresh = rope_d2)
+
+  # 90 % credible intervals
+  ci_lo <- 0.05; ci_hi <- 0.95
+
+  list(
+    summary = tibble(
+      ROI = roi_name,
+      pooled_sd       = round(pooled_sd, 4),
+      rope_d1         = round(rope_d1, 4),
+      rope_d2         = round(rope_d2, 4),
+      level_onset_ci  = round(level_onset, 1),
+      deriv_onset_ci  = round(deriv_onset, 1),
+      # d = 0.1
+      d1_med = round(median(post_onset_d1, na.rm = TRUE), 1),
+      d1_lo  = round(quantile(post_onset_d1, ci_lo, na.rm = TRUE), 1),
+      d1_hi  = round(quantile(post_onset_d1, ci_hi, na.rm = TRUE), 1),
+      d1_pct_no = round(100 * mean(is.na(post_onset_d1)), 1),
+      # d = 0.2
+      d2_med = round(median(post_onset_d2, na.rm = TRUE), 1),
+      d2_lo  = round(quantile(post_onset_d2, ci_lo, na.rm = TRUE), 1),
+      d2_hi  = round(quantile(post_onset_d2, ci_hi, na.rm = TRUE), 1),
+      d2_pct_no = round(100 * mean(is.na(post_onset_d2)), 1)
+    ),
+    smooth          = sm,
+    deriv           = deriv,
+    post_onset_d1   = post_onset_d1,
+    post_onset_d2   = post_onset_d2
+  )
+}
+
+# Run for ROI-level models
+# Seed the posterior / simultaneous-CI simulations so onset CIs are reproducible
+# across knits (manuscript text must match Supplementary Table 2 exactly).
+set.seed(20260716)
+roi_divergence <- age_group_ps_models %>%
+  filter(!map_lgl(model, is.null)) %>%
+  mutate(div = map2(model, ROI, compute_divergence)) %>%
+  pull(div)
+
+# Run for Subcortex_Total
+sub_mod <- global_comp_agegroup_models %>%
+  filter(ROI == "Subcortex_Total", !map_lgl(model, is.null))
+if (nrow(sub_mod) > 0) {
+  roi_divergence <- c(roi_divergence,
+                      list(compute_divergence(sub_mod$model[[1]], "Subcortex_Total")))
+}
+
+# Assemble summary table
+divergence_table <- bind_rows(map(roi_divergence, "summary")) %>%
+  mutate(ROI_Label = label_roi(ROI)) %>%
+  arrange(deriv_onset_ci)
+
+# Full curve data for Figure 2 Panel C
+divergence_smooth <- bind_rows(map(roi_divergence, "smooth"))
+divergence_deriv  <- bind_rows(map(roi_divergence, "deriv"))
+
+save_table(divergence_table, "table4b_divergence_onset", "Divergence onset timing (full data)")
+```
+
+### Divergence Onset: Tables & Distributions
+
+Each posterior draw yields a full TD-PS difference curve. For each draw we take the
+the earliest age after which the difference permanently exceeds a cohen's d threshold of either .1 or .2.
+
+All credible intervals are 90 %
+
+```{r age_group_divergence_posterior, fig.width=14, fig.height=10}
+# Reference only (NOT a manuscript table): compares divergence timing across
+# effect-size cutoffs (ROPE Cohen's d = 0.1 vs d = 0.2), all regions.
+divergence_table %>%
+  select(ROI_Label,
+         d1_med, d1_lo, d1_hi,
+         d2_med, d2_lo, d2_hi) %>%
+  kable(col.names = c("Region",
+                       "Median", "5 %", "95 %",
+                       "Median", "5 %", "95 %"),
+        caption = "Divergence timing across effect-size cutoffs (ROPE d = 0.1 vs d = 0.2, 10 000 draws, 90 % CI, years) - reference, not a manuscript table",
+        digits = 1) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
+  add_header_above(c(" " = 1,
+                     "d = 0.1 (years)" = 3,
+                     "d = 0.2 (years)" = 3))
+
+# Supplementary Table 2 (the official, reported-in-text table): divergence timing
+# at ROPE d = 0.2 only.
+divergence_table %>%
+  select(ROI_Label, d2_med, d2_lo, d2_hi) %>%
+  kable(col.names = c("Region", "Median", "5 %", "95 %"),
+        caption = "Supplementary Table 2. Posterior divergence timing (10 000 draws, 90 % CI, ROPE d = 0.2, years)",
+        digits = 1) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+
+# Build long-format onset data for density plots
+post_onset_df <- map_dfr(roi_divergence, function(div) {
+  roi <- div$summary$ROI
+  bind_rows(
+    tibble(ROI = roi, onset_type = "d = 0.1", onset_age = div$post_onset_d1),
+    tibble(ROI = roi, onset_type = "d = 0.2", onset_age = div$post_onset_d2)
+  )
+}) %>%
+  filter(!is.na(onset_age)) %>%
+  mutate(ROI_Label = label_roi(ROI))
+
+# Keep ROIs where >= 50 % of draws have a defined onset for at least one metric
+n_sim_total <- length(roi_divergence[[1]]$post_onset_d1)
+rois_with_onset <- post_onset_df %>%
+  count(ROI_Label, onset_type) %>%
+  filter(n > 0.5 * n_sim_total) %>%
+  pull(ROI_Label) %>%
+  unique()
+
+# Median lines
+median_lines <- divergence_table %>%
+  filter(ROI_Label %in% rois_with_onset) %>%
+  select(ROI_Label, d1_med, d2_med) %>%
+  pivot_longer(cols = c(d1_med, d2_med),
+               names_to = "onset_type", values_to = "median_onset") %>%
+  mutate(onset_type = case_when(
+    grepl("d1", onset_type) ~ "d = 0.1",
+    TRUE ~ "d = 0.2"
+  ))
+
+onset_colors <- c("d = 0.1" = "#35978f", "d = 0.2" = "#1b7837")
+
+ggplot(post_onset_df %>% filter(ROI_Label %in% rois_with_onset),
+       aes(x = onset_age, fill = onset_type)) +
+  geom_density(alpha = 0.35, color = NA) +
+  geom_vline(data = median_lines,
+             aes(xintercept = median_onset, color = onset_type),
+             linetype = "dashed", linewidth = 0.7) +
+  facet_wrap(~ ROI_Label, scales = "free_y") +
+  scale_fill_manual(values = onset_colors, name = NULL) +
+  scale_color_manual(values = onset_colors, name = NULL) +
+  labs(x = "Age (years)", y = "Posterior density",
+       title = "Posterior distributions of divergence timing",
+       subtitle = "ROPE permanent departure at d = 0.1 and d = 0.2  |  Dashed = medians  |  90 % CI") +
+  theme(legend.position = "bottom",
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"))
+```
+
+# Figure 2
+
+```{r figure_2, fig.width=20, fig.height=10}
+
+roi_order_fig <- roi_order_conceptual[roi_order_conceptual %in% unique(age_group_ps_results$ROI)]
+
+sub_agegroup_mod <- global_comp_agegroup_models %>%
+  filter(ROI == "Subcortex_Total") %>% pull(model) %>% .[[1]]
+
+# Divergence onset ages (d=0.2 posterior median) for ROIs with p < 0.05
+sig_onset <- divergence_table %>%
+  select(ROI, d2_med) %>%
+  filter(!is.na(d2_med))
+
+# Subcortex_Total onset (for Panel A)
+sub_onset_val <- sig_onset %>% filter(ROI == "Subcortex_Total") %>% pull(d2_med)
+
+# Significant ROI-level onsets (for Panel B) - where interaction p < 0.05
+sig_roi_onset <- sig_onset %>%
+  inner_join(age_group_ps_results %>% filter(p.value < 0.05) %>%
+               select(ROI), by = "ROI")
+
+#### Panel A ####
+# Pull p and FDR for Subcortex_Total from global composite results
+sub_stats <- global_agegroup_comp_results %>%
+  filter(ROI == "Subcortex_Total")
+sub_lab   <- format_sig_label(sub_stats$p.value)
+
+# Determine diverge_age for Panel A (NULL if not significant)
+sub_diverge <- if (sub_stats$p.value < 0.05 && length(sub_onset_val) > 0) sub_onset_val else NULL
+
+p_A <- partial_resid_plot(
+  sub_agegroup_mod, term = "age", int.term = "ostudy.group", group.term = "subid",
+  xlabel = "Age (years)", ylabel = "Susceptibility (ppm)",
+  show.data = TRUE, add.intercept = TRUE,
+  focus_context = TRUE, diverge_age = sub_diverge
+) +
+  labs(title = "Global subcortical", subtitle = sub_lab$lbl) +
+  scale_color_manual(values = group_colors,
+                     labels = c("TD" = "Typically Developing",
+                                "PS" = "Psychosis Spectrum"),
+                     name = NULL,
+                     aesthetics = c("fill", "color")) +
+  guides(shape = "none") +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_markdown(hjust = 0.5, size = 12,
+                                     color = sub_lab$col,
+                                     margin = margin(b = 2)),
+    legend.position = "bottom",
+    legend.direction = "vertical",
+    legend.justification = c(0, 1),
+    legend.key = element_blank()
+  )
+
+#### Panel B: ROI grid ####
+scatter_plots <- age_group_ps_models %>%
+  filter(ROI %in% roi_order_fig) %>%
+  arrange(match(ROI, roi_order_fig)) %>%
+  left_join(age_group_ps_results %>% select(ROI, p.value, p.fdr), by = "ROI") %>%
+  left_join(sig_roi_onset %>% select(ROI, d2_med), by = "ROI") %>%
+  mutate(
+    plot = pmap(list(model, ROI, p.value, p.fdr, row_number(), d2_med), ~ {
+      mod <- ..1; roi <- ..2; pv <- ..3; pfdr <- ..4; idx <- ..5
+      onset_age <- ..6
+
+      sl <- format_sig_label(pv, pfdr)
+
+      is_left   <- idx %in% c(1, 5)
+      is_bottom <- idx %in% c(5, 6, 7, 8)
+
+      # diverge_age is set only for significant ROIs (p < 0.05)
+      div_age <- if (!is.na(onset_age)) onset_age else NULL
+
+      p <- partial_resid_plot(
+        mod, term = "age", int.term = "ostudy.group", group.term = "subid",
+        plot.title = label_roi(roi),
+        xlabel = if (is_bottom) "Age (years)" else "",
+        ylabel = if (is_left)   "Susceptibility (ppm)"   else "",
+        show.data = TRUE, add.intercept = TRUE,
+        focus_context = TRUE, diverge_age = div_age
+      ) +
+        labs(subtitle = sl$lbl) +
+        scale_color_manual(values = group_colors) +
+        scale_fill_manual(values  = group_colors) +
+        theme(
+          legend.position = "none",
+          plot.title      = element_text(hjust = 0.5),
+          plot.subtitle   = element_markdown(hjust = 0.5, size = 12,
+                                             color = sl$col,
+                                             margin = margin(b = 2))
+        )
+
+      if (!is_left)   p <- p + theme(axis.title.y = element_blank())
+      if (!is_bottom) p <- p + theme(axis.title.x = element_blank())
+
+      p
+    })
+  )
+
+# Assemble and save Figure 2
+p_B <- wrap_plots(scatter_plots$plot, ncol = 4)
+p_A_padded <- plot_spacer() / p_A / plot_spacer() +
+  plot_layout(heights = c(1, 3, 1))
+
+final_fig <- (p_A_padded | p_B) +
+  plot_layout(widths = c(1, 4)) +
+  plot_annotation(tag_levels = list(c("A", "B")))
+final_fig
+save_fig(final_fig, "fig2_age_group", width = 20, height = 10)
+
+```
+
+### Longitudinal Robustness: Within- vs Between-Person Developmental Slopes
+
+Mixed-effects models represent age with a single term that blends within-person
+(longitudinal) and between-person (cross-sectional) variation. In the participants with
+repeat visits we can separate the two: age is split into each subject's mean age
+(between-person) and their deviation across visits (within-person) -- a within-between
+(Mundlak) decomposition. Because this decomposition requires additive linear age terms,
+these models are fit as linear mixed models (lme4), a linear approximation of the
+developmental slope complementary to the primary GAMMs. For each region we read the
+between- and within-person age slope separately for each group, asking whether the iron
+increase and the TD-PS divergence hold *within individuals* -- a stronger test that the
+effects are genuinely developmental rather than stable between-person differences. Because
+the within-person contrast comes from a small subset over a narrow age range, effect size
+(the magnitude of the slope), not statistical significance, is the primary readout.
+
+```{r within-between-analysis, cache=TRUE, dependson="df_checkpoint"}
+# How much longitudinal data do we have?
+visit_counts <- df %>% count(subid, name = "n_vis")
+n_subj  <- nrow(visit_counts)
+n_long  <- sum(visit_counts$n_vis >= 2)
+age_dev <- df %>% filter(!is.na(age)) %>%
+  group_by(subid) %>% mutate(age_wi = age - mean(age)) %>% ungroup()
+
+disaggregation_design <- tibble::tibble(
+  Metric = c("Subjects", "Subjects with >= 2 visits", "% longitudinal",
+             "Within-person age deviation (yr)"),
+  Value  = c(as.character(n_subj),
+             as.character(n_long),
+             sprintf("%.0f%%", 100 * n_long / n_subj),
+             sprintf("[%.1f, %.1f]", min(age_dev$age_wi), max(age_dev$age_wi)))
+)
+
+# Group-specific between/within age slopes. The between/within (Mundlak) split
+# requires additive linear age terms, so these are LINEAR mixed models (a linear
+# approximation complementary to the primary GAMMs); each group's slope is read
+# off the interaction model by re-referencing study.group.
+disag_rois <- c(rois$global, rois$primary)
+
+group_slopes <- purrr::map_dfr(disag_rois, function(roi) {
+  d <- df %>%
+    filter(!is.na(.data[[roi]]), !is.na(age)) %>%
+    mutate(QSM = .data[[roi]]) %>%
+    group_by(subid) %>%
+    mutate(age_bw = mean(age), age_wi = age - age_bw) %>%
+    ungroup()
+
+  read_slopes <- function(ref) {
+    d2 <- d %>% mutate(grp = relevel(factor(study.group), ref = ref))
+    m  <- lmerTest::lmer(QSM ~ age_bw * grp + age_wi * grp + sex + (1 | subid), data = d2)
+    tb <- broom.mixed::tidy(m, effects = "fixed")
+    g  <- function(tm, col) { v <- tb[[col]][tb$term == tm]; if (length(v)) v[1] else NA_real_ }
+    list(bw = g("age_bw", "estimate"), bw_p = g("age_bw", "p.value"),
+         wi = g("age_wi", "estimate"), wi_p = g("age_wi", "p.value"))
+  }
+  td <- read_slopes("TD"); ps <- read_slopes("PS")
+  tibble(ROI = roi,
+         TD_bw = td$bw, TD_bw_p = td$bw_p, PS_bw = ps$bw, PS_bw_p = ps$bw_p,
+         TD_wi = td$wi, TD_wi_p = td$wi_p, PS_wi = ps$wi, PS_wi_p = ps$wi_p)
+})
+
+# Slopes x 1000 (units of 10^-3 ppm / year)
+group_slopes_x3 <- group_slopes %>%
+  mutate(Region = label_roi(ROI),
+         across(c(TD_bw, PS_bw, TD_wi, PS_wi), ~ .x * 1000)) %>%
+  select(Region, TD_bw, PS_bw, TD_wi, PS_wi, TD_bw_p, PS_bw_p, TD_wi_p, PS_wi_p)
+save_table(group_slopes_x3, "table_within_between",
+           "Group-specific between/within age slopes (x1000 ppm/yr)")
+
+# --- Display: design descriptives ---
+disaggregation_design %>%
+  kable(caption = "Longitudinal information available for the within/between decomposition") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+
+# --- Display: group-specific slopes (x1000 ppm/yr) ---
+group_slopes_x3 %>%
+  transmute(Region, `Btwn TD` = TD_bw, `Btwn PS` = PS_bw,
+            `Wthn TD` = TD_wi, `Wthn PS` = PS_wi) %>%
+  present_results(highlight_sig = FALSE)
+
+# --- Figure: group-specific between/within slopes ---
+gs_long <- group_slopes %>%
+  transmute(Region = factor(label_roi(ROI), levels = label_roi(c(rois$global, rois$primary))),
+            `Between-person: TD` = TD_bw * 1000, `Between-person: PS` = PS_bw * 1000,
+            `Within-person: TD`  = TD_wi * 1000, `Within-person: PS`  = PS_wi * 1000) %>%
+  pivot_longer(-Region, names_to = "key", values_to = "estimate") %>%
+  separate(key, into = c("Component", "Group"), sep = ": ") %>%
+  mutate(Component = factor(Component, levels = c("Between-person", "Within-person")),
+         Group     = factor(Group, levels = c("TD", "PS")))
+
+fig_within_between <- ggplot(gs_long, aes(x = Region, y = estimate, fill = Group)) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.3) +
+  geom_col(position = position_dodge(0.7), width = 0.65, color = "grey30", linewidth = 0.2) +
+  facet_wrap(~ Component, scales = "free_y", ncol = 1) +
+  scale_fill_manual(values = group_colors, labels = group_labels, name = NULL) +
+  labs(x = NULL, y = expression("Age slope (" * 10^-3 * " ppm / year)"),
+       title = "Group-specific developmental slopes",
+       subtitle = "TD accumulate iron within-person; PS largely do not") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        legend.position = "top", strip.background = element_blank(),
+        strip.text = element_text(face = "bold"))
+fig_within_between
+save_fig(fig_within_between, "suppfig_within_between", width = 9, height = 8)
+
+rm(age_dev, visit_counts, gs_long)
+```
+
+# Regional Overview: Levels, Reliability, and Trajectories
+
+A single overview of the analyzed regions (whole-subcortex composite first, then each primary
+ROI): regional iron levels, test-retest reliability, and developmental trajectories. The
+trajectory panels reuse the fitted developmental GAMMs (the same models behind the age-effect
+results), plotting the age marginal effect with partial residuals - consistent with Figure 2.
+Two versions are produced: a compact main-text candidate (trajectory small-multiples with the
+ICC annotated in each panel) and a fuller supplementary version (levels -> test-retest -> trajectories).
+
+```{r figure_regional_overview, fig.width=12, fig.height=15}
+# Region order: whole-subcortex composite first, then primary ROIs (striatum -> midbrain)
+region_order <- c("Subcortex_Total", "Ca", "Pu", "NAC", "Pallidum_Total",
+                  "SN_Total", "VTA_Total", "RN", "STH")
+region_labs  <- label_roi(region_order)
+
+# --- Test-retest reliability (ICC) for the analyzed regions ------------------
+reliability_rois <- c(rois$primary, rois$global)
+df_longitudinal  <- df %>% group_by(subid) %>% filter(n() >= 2) %>% ungroup()
+
+calculate_icc <- function(data, roi) {
+  model <- lmer(as.formula(paste0(roi, " ~ 1 + (1|subid)")), data = data)
+  vc <- as.data.frame(VarCorr(model))
+  vc$vcov[1] / sum(vc$vcov)
+}
+
+icc_results <- tibble(
+  ROI = reliability_rois,
+  ICC = map_dbl(reliability_rois, ~ calculate_icc(df_longitudinal, .x))
+) %>% arrange(desc(ICC))
+
+# Test-retest data for subjects with exactly two timepoints
+df_test_retest <- df_longitudinal %>%
+  group_by(subid) %>% filter(n() == 2) %>% arrange(age) %>%
+  mutate(timepoint = row_number()) %>% ungroup() %>%
+  select(subid, timepoint, all_of(reliability_rois)) %>%
+  pivot_longer(all_of(reliability_rois), names_to = "ROI", values_to = "QSM") %>%
+  pivot_wider(names_from = timepoint, values_from = QSM, names_prefix = "Time_")
+
+# Test-retest scatter for an arbitrary set of ROIs, with per-panel ICC annotation
+test_retest_plot <- function(roi_set, plot_title, ncol = NULL) {
+  dat <- df_test_retest %>%
+    filter(ROI %in% roi_set) %>%
+    mutate(ROI = factor(ROI, levels = roi_set))
+  icc_lab <- icc_results %>%
+    filter(ROI %in% roi_set) %>%
+    mutate(ROI = factor(ROI, levels = roi_set),
+           label = sprintf("ICC = %.2f", ICC))
+  ggplot(dat, aes(x = Time_1, y = Time_2)) +
+    geom_point(alpha = 0.5, color = "grey30") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+    geom_smooth(method = "lm", se = TRUE, color = "black", fill = "grey75") +
+    geom_text(data = icc_lab, aes(x = -Inf, y = Inf, label = label),
+              hjust = -0.1, vjust = 1.4, size = 3.5, inherit.aes = FALSE) +
+    facet_wrap(~ ROI, scales = "free", ncol = ncol,
+               labeller = as_labeller(roi_labels)) +
+    labs(title = plot_title,
+         x = "Time 1 Susceptibility (ppm)", y = "Time 2 Susceptibility (ppm)")
+}
+
+# --- (1) Regional iron levels: distribution per region (box plots) ----------
+df_region <- df %>%
+  pivot_longer(all_of(region_order), names_to = "ROI", values_to = "QSM") %>%
+  filter(!is.na(QSM)) %>%
+  mutate(ROI = factor(label_roi(ROI), levels = region_labs))
+
+p_levels <- ggplot(df_region, aes(ROI, QSM)) +
+  geom_boxplot(fill = "grey90", color = "grey20", outlier.size = 0.5,
+               outlier.alpha = 0.4, linewidth = 0.4) +
+  labs(title = "Regional iron levels", x = NULL, y = "Susceptibility (ppm)") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+# --- (2) Developmental trajectories: reuse the fitted GAMMs (age marginal
+# effect with partial residuals), whole subcortex first then primary ROIs -----
+traj_models <- bind_rows(
+  global_comp_age_models %>% filter(ROI == "Subcortex_Total") %>% select(ROI, model),
+  age_main_models %>% filter(ROI %in% setdiff(region_order, "Subcortex_Total")) %>%
+    select(ROI, model)
+) %>% mutate(ROI = factor(ROI, levels = region_order)) %>% arrange(ROI)
+
+base_traj <- map2(traj_models$model, as.character(traj_models$ROI), ~ partial_resid_plot(
+  .x, term = "age", group.term = "subid", plot.title = label_roi(.y),
+  xlabel = "Age (years)", ylabel = "Susceptibility (ppm)",
+  show.data = TRUE, add.intercept = TRUE))
+
+p_traj <- wrap_plots(base_traj, ncol = 3)
+
+# --- (3) Test-retest scatter (Time 1 vs Time 2), Subcortex first ------------
+p_icc_scatter <- test_retest_plot(region_order, "Test-retest reliability (Time 1 vs Time 2)",
+                                  ncol = 3)
+
+# --- Main-text candidate: trajectory grid with the ICC annotated in-panel ---
+traj_icc <- map2(base_traj, as.character(traj_models$ROI), function(p, r) {
+  icc <- icc_results$ICC[icc_results$ROI == r]
+  p + annotate("text", x = Inf, y = Inf, label = sprintf("ICC = %.2f", icc),
+               hjust = 1.1, vjust = 1.5, size = 3.4, color = "grey25")
+})
+fig_regional_main <- wrap_plots(traj_icc, ncol = 3)
+fig_regional_main
+save_fig(fig_regional_main, "fig_regional_overview_main", width = 11, height = 10)
+
+# --- Supplementary: levels -> reliability -> trajectories -------------------
+# Direct nesting keeps panel widths aligned across A-C (wrap_elements would break
+# that). Tag the trajectory grid's first panel so the 3x3 block reads as a single
+# Panel C instead of auto-tagging each sub-panel C, D, E, ...
+traj_tag <- base_traj
+traj_tag[[1]] <- traj_tag[[1]] + labs(tag = "C")
+p_traj_c <- wrap_plots(traj_tag, ncol = 3)
+
+suppfig_regional <- (p_levels + labs(tag = "A")) /
+                    (p_icc_scatter + labs(tag = "B")) /
+                    p_traj_c +
+  plot_layout(heights = c(0.4, 1.1, 1.8))
+suppfig_regional <- suppfig_regional &
+  theme(plot.tag = element_text(face = "bold", size = 16))
+suppfig_regional
+save_fig(suppfig_regional, "suppfig_regional_overview", width = 12, height = 18)
+
+# Developmental GAMMs no longer needed after this figure.
+rm(global_comp_age_models, age_main_models)
+```
+
+# Disorder-Cognition Relationships {.tabset}
+
+Establishes the total effect of diagnosis on cognition (prerequisite for mediation).
+Runs on all subjects (TD + PS).
+
+## Main Effects
+
+```{r dx_cog_main_effects, cache=TRUE, dependson="df_checkpoint"}
+df_cog <- df %>%
+  pivot_longer(all_of(cog_measures$efficiency), 
+               names_to = "Cog.Domain", values_to = "Cog.Score")
+
+dx_cog_main_models <- df_cog %>%
+  group_by(Cog.Domain) %>%
+  summarise(
+    model = list(mgcv::gam(
+      Cog.Score ~ s(age, k=6) + osex + study.group + s(subid, bs = "re"),
+          method = "REML",
+          data = cur_data()
+    )),
+    .groups = "drop"
+  )
+
+dx_cog_main_results <- dx_cog_main_models %>%
+  mutate(tidy = map(model, ~ tidy_gam(.x, parametric = TRUE))) %>%
+  select(-model) %>%
+  unnest(tidy) %>%
+  filter(str_detect(term, "study.group")) %>%
+  group_by(Cog.Domain) %>%
+  mutate(p.fdr = p.adjust(p.value, "fdr")) %>%
+  ungroup() %>%
+  arrange(Cog.Domain, p.value)
+
+save_table(group_table(dx_cog_main_results, "Cog.Domain", "Domain", label_cog),
+           "supptable3_dx_cognition", "Supp Table 3: Diagnosis-cognition associations")
+
+dx_cog_main_results %>%
+  present_results()
+# dx_cog_main_models freed in dx_cog_main_viz after cog_grp_preds is built
+```
+
+```{r dx_cog_main_viz, fig.height=5, fig.width=10}
+# Marginal means via ggeffects - same pipeline as the QSM group differences plot.
+# Cohen's d uses unique subject counts per group (appropriate for mixed-model GAM).
+cog_grp_preds <- dx_cog_main_models %>%
+  mutate(
+    preds = map(model, ~ {
+      predict_response(.x, terms = "study.group", margin = "empirical") %>%
+        as.data.frame() %>%
+        rename(study.group = x, Cog_mean = predicted,
+               Cog_lower = conf.low, Cog_upper = conf.high)
+    }),
+    cohens_d = map_dbl(model, ~ {
+      n_grp <- distinct(.x$model, subid, study.group) %>% count(study.group)
+      t_val <- broom::tidy(.x, parametric = TRUE) %>%
+        filter(str_detect(term, "study.group")) %>%
+        pull(statistic)
+      n_td <- n_grp$n[n_grp$study.group == "TD"]
+      n_ps <- n_grp$n[n_grp$study.group == "PS"]
+      t_val * sqrt(1 / n_td + 1 / n_ps)
+    })
+  ) %>%
+  select(-model) %>%
+  unnest(preds) %>%
+  left_join(dx_cog_main_results %>% select(Cog.Domain, p.value, p.fdr),
+            by = "Cog.Domain") %>%
+  mutate(Domain = label_cog(Cog.Domain))
+
+# Per-domain annotation placed above the taller CI
+cog_grp_annot <- cog_grp_preds %>%
+  group_by(Cog.Domain, Domain, cohens_d, p.value, p.fdr) %>%
+  summarise(y_top = max(Cog_upper), .groups = "drop") %>%
+  mutate(
+    # Match the Figure 3 B/C convention: * = FDR < .05, dagger = nominal p < .05
+    sig_sym = case_when(p.fdr < 0.05 ~ "*", p.value < 0.05 ~ "†", TRUE ~ ""),
+    label   = sprintf("italic(d)==%.2f%s", cohens_d,
+                      ifelse(sig_sym != "", paste0("~'", sig_sym, "'"), ""))
+  )
+
+ggplot(cog_grp_preds, aes(x = study.group, y = Cog_mean, fill = study.group)) +
+  geom_errorbar(aes(ymin = Cog_lower, ymax = Cog_upper),
+                width = 0.1, color = "grey30", linewidth = 0.8) +
+  geom_point(shape = 21, size = 4, color = "grey30", stroke = 1) +
+  geom_text(data = cog_grp_annot,
+            aes(x = 1.5, y = y_top, label = label),
+            inherit.aes = FALSE, parse = TRUE,
+            vjust = -0.4, size = 2.8, color = "grey20") +
+  facet_wrap(~ Domain, nrow = 1, scales = "free_y") +
+  scale_fill_manual(values = group_colors,
+                    labels = c("TD" = "Typically Developing", "PS" = "Psychosis Spectrum"),
+                    name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.15))) +
+  labs(x = NULL, y = "Adjusted Performance") +
+  theme(strip.text = element_text(face = "bold"), strip.background = element_blank(),
+        axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        legend.position = "bottom")
+# cog_grp_preds and cog_grp_annot kept - reused in figure_4_paper
+rm(dx_cog_main_models)
+```
+
+## Age x Dx Interaction Effects
+
+```{r dx_cog_age_interaction, cache=TRUE, dependson="df_checkpoint"}
+# Age x diagnosis interaction on cognition (do group diffs in cognition increase over time/development?).
+dx_cog_agex_models <- df_cog %>%
+  group_by(Cog.Domain) %>%
+  summarise(
+    model = list(mgcv::gam(
+      Cog.Score ~ s(age, by = ostudy.group, k=4) + s(age, k=6) + osex + ostudy.group + s(subid, bs = "re"),
+          method = "REML",
+          data = cur_data()
+    )),
+    .groups = "drop"
+  )
+
+dx_cog_agex_results <- dx_cog_agex_models %>%
+  mutate(tidy = map(model, tidy_gam)) %>%
+  select(-model) %>%
+  unnest(tidy) %>%
+  filter(str_detect(term, "ostudy.group")) %>%
+  group_by(Cog.Domain) %>%
+  mutate(p.fdr = p.adjust(p.value, "fdr")) %>%
+  ungroup() %>%
+  arrange(Cog.Domain, p.value)
+
+save_table(reg_table(dx_cog_agex_results, "Cog.Domain", "Domain", label_cog),
+           "supptable4_dx_cog_age_group",
+           "Supp Table 4: Age x group interactions on cognition")
+
+dx_cog_agex_results %>%
+  present_results()
+rm(df_cog)
+```
+
+```{r suppfig2_dx_cog_age_interaction, fig.height=5, fig.width=20}
+# Keep consistent ordering of cog domains in figures. 
+cog_dom_order <- c("Overall_Efficiency", "SocialCog_Efficiency", "Memory_Efficiency",
+                   "Executive_Efficiency", "Complex_Efficiency")
+
+# Use the most significant interaction term per domain for annotation
+dx_cog_sig <- dx_cog_agex_results %>%
+  group_by(Cog.Domain) %>%
+  slice_min(p.value, n = 1) %>%
+  ungroup() %>%
+  select(Cog.Domain, p.value, p.fdr)
+
+suppfig2_plots <- dx_cog_agex_models %>%
+  mutate(Cog.Domain = factor(Cog.Domain, levels = cog_dom_order)) %>%
+  arrange(Cog.Domain) %>%
+  left_join(dx_cog_sig, by = "Cog.Domain") %>%
+  mutate(
+    plot = pmap(
+      list(model, Cog.Domain, p.value, p.fdr),
+      function(m, c, pval, pfdr) {
+        sl <- format_sig_label(pval, pfdr)
+        partial_resid_plot(
+          m,
+          term = "age",
+          int.term = "ostudy.group",
+          group.term = "subid",
+          plot.title = label_cog(as.character(c)),
+          xlabel = "Age (years)",
+          ylabel = "Performance",
+          show.data = TRUE,
+          add.intercept = TRUE
+        ) +
+          labs(subtitle = sl$lbl) +
+          theme(
+            plot.subtitle = element_markdown(hjust = 0.5, size = 10, color = sl$col),
+            legend.position = "none"
+          )
+      }
+    )
+  )
+
+suppfig2 <- wrap_plots(suppfig2_plots$plot, nrow = 1) +
+  plot_annotation(theme = theme(plot.margin = margin(5, 5, 5, 5)))
+
+# Extract legend from one plot and add at bottom
+legend_plot <- partial_resid_plot(
+  suppfig2_plots$model[[1]], term = "age", int.term = "ostudy.group",
+  group.term = "subid", show.data = TRUE, add.intercept = TRUE
+) + theme(legend.position = "bottom")
+shared_legend <- cowplot::get_legend(legend_plot)
+suppfig2 <- wrap_plots(suppfig2, shared_legend, ncol = 1, heights = c(10, 0.5))
+
+suppfig2
+save_fig(suppfig2, "suppfig2_dx_cog_age_group", width = 20, height = 5)
+rm(dx_cog_agex_models, dx_cog_agex_results, dx_cog_sig,
+   suppfig2_plots, suppfig2, legend_plot, shared_legend)
+```
+
+# QSM-Cognition Relationships {.tabset}
+
+Tests whether regional QSM predicts cognitive performance, controlling for age, sex, and group.
+All subjects (TD + PS) are included.
+
+## Global
+
+```{r qsm_cog_global, cache=TRUE, dependson="df_checkpoint", fig.height=5, fig.width=15 }
+df_qsm_cog_global <- df %>%
+  pivot_longer(all_of(cog_measures$efficiency), names_to = "Cog.Domain", values_to = "Cog.Score") %>%
+  mutate(QSM = Subcortex_Total,
+         Cog.Domain.Label = str_remove(Cog.Domain, "_Efficiency"),
+         Cog.Domain.Label = factor(Cog.Domain.Label,
+                                   levels = c("Overall",
+                                              setdiff(unique(Cog.Domain.Label), "Overall"))))
+
+# --- 1. Main effect ---
+qsm_cog_global_main <- df_qsm_cog_global %>%
+  group_by(Cog.Domain, Cog.Domain.Label) %>%
+  summarise(
+    model = list(tryCatch(
+      mgcv::gam(Cog.Score ~ s(age) + s(QSM) + osex + study.group + s(subid, bs = "re"),
+                method = "REML", data = cur_data()),
+      error = function(e) NULL
+    )), .groups = "drop"
+  ) %>%
+  filter(!map_lgl(model, is.null)) %>%
+  arrange(Cog.Domain.Label)
+
+global_main_res <- qsm_cog_global_main %>%
+  mutate(tidy = map(model, tidy_gam)) %>%
+  select(-model) %>% unnest(tidy) %>%
+  filter(term == "s(QSM)") %>%
+  mutate(p.fdr = p.adjust(p.value, "fdr"),
+         across(where(is.numeric), ~ round(., 4))) %>%
+  arrange(Cog.Domain.Label)
+
+cat("**Main effect of Subcortex_Total on cognition:**\n")
+global_main_res %>%
+  kable(caption = "Subcortex_Total - main effect on cognitive efficiency") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed")) %>%
+  row_spec(which(global_main_res$p.value < 0.05), bold = TRUE, color = "darkred")
+
+plots_main <- pmap(
+  list(qsm_cog_global_main$model,
+       qsm_cog_global_main$Cog.Domain.Label,
+       global_main_res$p.value[match(qsm_cog_global_main$Cog.Domain,
+                                     global_main_res$Cog.Domain)],
+       global_main_res$p.fdr[match(qsm_cog_global_main$Cog.Domain,
+                                   global_main_res$Cog.Domain)],
+       global_main_res$partial_eta2[match(qsm_cog_global_main$Cog.Domain,
+                                          global_main_res$Cog.Domain)],
+       seq_len(nrow(qsm_cog_global_main))),
+  function(m, lbl, pv, pfdr, eta2, idx) {
+    sl <- format_sig_label(pv, pfdr, eta2)
+    is_left <- idx == 1
+
+    p <- partial_resid_plot(
+      m, term = "QSM", group.term = "subid",
+      plot.title = label_cog(lbl),
+      xlabel = "Global subcortical susceptibility (ppm)",
+      ylabel = if (is_left) "Performance" else "",
+      show.data = TRUE, add.intercept = TRUE
+    ) +
+      labs(subtitle = sl$lbl) +
+      scale_x_continuous(n.breaks = 4, labels = function(x) sprintf("%.2f", x)) +
+      theme(
+        plot.title    = element_text(hjust = 0.5),
+        plot.subtitle = element_markdown(hjust = 0.5, size = 7,
+                                         color = sl$col,
+                                         margin = margin(b = 2))
+      )
+    if (!is_left) p <- p + theme(axis.title.y = element_blank())
+    p
+  }
+)
+
+p_main <- wrap_plots(plots_main, nrow = 1) +
+  plot_layout(axis_titles = "collect")   # one shared, centered x-axis title
+p_main
+
+# --- 2. QSM x group interaction ---
+qsm_cog_global_int <- df_qsm_cog_global %>%
+  group_by(Cog.Domain, Cog.Domain.Label) %>%
+  summarise(
+    model = list(tryCatch(
+      mgcv::gam(
+        Cog.Score ~ s(age, k=6) + s(QSM, k=5) + s(QSM, by = ostudy.group, k=5) +
+          ostudy.group + osex + s(subid, bs = "re"),
+        method = "REML", data = cur_data()
+      ), error = function(e) NULL
+    )), .groups = "drop"
+  ) %>%
+  filter(!map_lgl(model, is.null)) %>%
+  arrange(Cog.Domain.Label)
+
+global_int_res <- qsm_cog_global_int %>%
+  mutate(tidy = map(model, ~ broom::tidy(.x, parametric = FALSE))) %>%
+  select(-model) %>% unnest(tidy) %>%
+  filter(str_detect(term, "ostudy.group")) %>%
+  mutate(p.fdr = p.adjust(p.value, "fdr"),
+         across(where(is.numeric), ~ round(., 4))) %>%
+  arrange(Cog.Domain.Label)
+
+cat("\n**Subcortex_Total x group interaction (PS - TD difference smooth):**\n")
+global_int_res %>%
+  kable(caption = "Subcortex_Total - QSM x group interaction") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed")) %>%
+  row_spec(which(global_int_res$p.value < 0.05), bold = TRUE, color = "darkred")
+
+plots_int <- pmap(
+  list(qsm_cog_global_int$model,
+       qsm_cog_global_int$Cog.Domain.Label,
+       global_int_res$p.value[match(qsm_cog_global_int$Cog.Domain,
+                                    global_int_res$Cog.Domain)],
+       global_int_res$p.fdr[match(qsm_cog_global_int$Cog.Domain,
+                                  global_int_res$Cog.Domain)],
+       seq_len(nrow(qsm_cog_global_int))),
+  function(m, lbl, pv, pfdr, idx) {
+    sl <- format_sig_label(pv, pfdr)
+    is_left <- idx == 1
+
+    p <- partial_resid_plot(
+      m, term = "QSM", int.term = "ostudy.group", group.term = "subid",
+      plot.title = label_cog(lbl),
+      xlabel = "Global subcortical susceptibility (ppm)",
+      ylabel = if (is_left) "Performance" else "",
+      show.data = TRUE, add.intercept = TRUE
+    ) +
+      labs(subtitle = sl$lbl) +
+      scale_color_manual(values = group_colors,
+                         labels = c("TD" = "Typically Developing",
+                                    "PS" = "Psychosis Spectrum"),
+                         name = NULL,
+                         aesthetics = c("fill", "color")) +
+      guides(shape = "none") +
+      theme(
+        plot.title    = element_text(hjust = 0.5),
+        plot.subtitle = element_markdown(hjust = 0.5, size = 7,
+                                         color = sl$col,
+                                         margin = margin(b = 2)),
+        legend.position = "none"
+      )
+    if (!is_left) p <- p + theme(axis.title.y = element_blank())
+    p
+  }
+)
+
+wrap_plots(plots_int, nrow = 1, guides = "collect") +
+  plot_layout(axis_titles = "collect") &
+  theme(legend.position = "bottom")
+
+# Keep p_main - used in figure_3_global_cog chunk; free everything else
+rm(qsm_cog_global_main, qsm_cog_global_int, df_qsm_cog_global,
+   plots_main, plots_int, global_main_res, global_int_res)
+gc()
+```
+
+## Region-wise
+
+### Main effects
+
+```{r qsm_cog_main_effects, cache=TRUE, dependson="df_checkpoint"}
+df_qsm_cog <- df %>%
+  pivot_longer(all_of(rois$primary), names_to = "ROI", values_to = "QSM") %>%
+  pivot_longer(all_of(cog_measures$efficiency), 
+               names_to = "Cog.Domain", values_to = "Cog.Score")
+
+qsm_cog_main_models <- df_qsm_cog %>%
+  group_by(ROI, Cog.Domain) %>%
+  summarise(
+    model = list(mgcv::gam(
+      Cog.Score ~ s(age) + s(QSM) + osex + study.group + s(subid, bs = "re"),
+          method = "REML",
+          data = cur_data()
+    )),
+    .groups = "drop"
+  )
+
+qsm_cog_main_results <- qsm_cog_main_models %>%
+  mutate(
+    tidy = map(model, ~ {
+      mod_gam <- .x
+      tidy.df <- broom::tidy(mod_gam, parametric = FALSE) %>%
+        mutate(N = nrow(mod_gam$model)) %>%
+        relocate(N, .after = term)
+      eta2 <- effectsize::eta_squared(mod_gam, partial = TRUE) %>%
+          select(Parameter, partial_eta2 = Eta2_partial)
+      tidy.df <- tidy.df %>%
+        left_join(eta2, by = c("term" = "Parameter"))
+      return(tidy.df)
+    })) %>%
+  select(-model) %>%
+  unnest(tidy) %>%
+  filter(term == "s(QSM)") %>%
+  group_by(Cog.Domain) %>%
+  mutate(p.fdr = p.adjust(p.value, "fdr")) %>%
+  ungroup() %>%
+  arrange(Cog.Domain, p.value)
+
+save_table(reg_table(qsm_cog_main_results, c("ROI", "Cog.Domain"),
+                     c("Region", "Domain"), list(label_roi, label_cog)),
+           "table5_qsm_cognition", "Table 5: QSM-cognition associations")
+```
+
+```{r cleanup_qsm_cog_models}
+# qsm_cog_main_results kept - used in summary table and figure_4_paper
+rm(qsm_cog_main_models)
+gc()
+```
+
+### QSM x group interactions
+
+```{r qsm_cognition_interactions, cache=TRUE, dependson="df_checkpoint", fig.width=12}
+qsm_cog_int_models <- df_qsm_cog %>%
+  group_by(ROI, Cog.Domain) %>%
+  summarise(
+    model = list(tryCatch(
+      mgcv::gam(
+        Cog.Score ~ s(age, k=6) + s(QSM, k=5) + s(QSM, by = ostudy.group, k=5) +
+                    ostudy.group + osex + s(subid, bs = "re"),
+        method = "REML", data = cur_data()
+      ), error = function(e) NULL
+    )),
+    .groups = "drop"
+  ) %>%
+  filter(!map_lgl(model, is.null))
+
+qsm_cog_int_results <- qsm_cog_int_models %>%
+  mutate(
+    tidy = map(model, ~ broom::tidy(.x, parametric = FALSE))
+  ) %>%
+  select(-model) %>%
+  unnest(tidy) %>%
+  filter(str_detect(term, "ostudy.group")) %>%
+  group_by(Cog.Domain) %>%
+  mutate(p.fdr = p.adjust(p.value, "fdr")) %>%
+  ungroup() %>%
+  arrange(Cog.Domain, p.value)
+
+qsm_cog_int_results %>%
+  filter(p.value < 0.05) %>%
+  present_results()
+
+sig_interactions <- qsm_cog_int_results %>%
+  filter(p.value < 0.05)
+
+if (nrow(sig_interactions) > 0) {
+  sig_models <- qsm_cog_int_models %>%
+    semi_join(sig_interactions, by = c("ROI", "Cog.Domain"))
+  
+  plots <- sig_models %>%
+    slice_head(n = 6) %>%
+    mutate(
+      plot = pmap(
+        list(model, ROI, Cog.Domain),
+        function(m, r, c) {
+          partial_resid_plot(
+            m,
+            term = "QSM",
+            int.term = "ostudy.group",
+            group.term = "subid",
+            plot.title = paste(label_roi(r), "-", label_cog(c)),
+            xlabel = paste0(label_roi(r), " Susceptibility (ppm)"),
+            ylabel = label_cog(c),
+            show.data = TRUE
+          ) +
+            scale_color_manual(values = group_colors, name = "Group") +
+            scale_fill_manual(values  = group_colors, name = "Group")
+        }
+      )
+    )
+
+  wrap_plots(plots$plot, ncol = 3)
+} else {
+  cat("No significant QSM x group interactions at p < 0.05")
+}
+rm(qsm_cog_int_models, qsm_cog_int_results)
+```
+
+### By group
+
+Joint models with a `by`-factor smooth fit per ROI x Domain, with a separate
+smooth estimated for each group. Two equivalent parameterisations are compared:
+
+- **Unordered factor** (`by = study.group`): each group gets its own smooth, each tested
+  against zero. Effect sizes (partial η²) per group reflect difference from zero (flat slope).
+- **Ordered factor** (`by = ostudy.group`): base smooth (TD) + difference smooth (PS - TD)
+  tested directly against zero. Should yield the same fit as above, but changes statistical decomposition. 
+  We now test if the *difference* between PS and TD is non-zero, akin to a 
+  classic interaction model (do the slopes ever differ?).
+  Effect size reflects the difference between groups.
+
+```{r qsm_cognition_by_group, cache=TRUE, dependson="df_checkpoint"}
+df_qsm_cog_bygroup <- df %>%
+  pivot_longer(all_of(rois$primary), names_to = "ROI", values_to = "QSM") %>%
+  pivot_longer(all_of(cog_measures$efficiency), names_to = "Cog.Domain", values_to = "Cog.Score") %>%
+  mutate(Domain = str_remove(Cog.Domain, "_Efficiency"))
+
+# Fit both parameterisations in a single pass - same data, same random effects
+qsm_bygrp_models <- df_qsm_cog_bygroup %>%
+  group_by(ROI, Cog.Domain) %>%
+  summarise(
+    mod_unord = list(tryCatch(
+      mgcv::gam(
+        Cog.Score ~ s(age, k=6) + s(QSM, by = study.group, k=5) +
+                    study.group + osex + s(subid, bs = "re"),
+        method = "REML", data = cur_data()
+      ), error = function(e) NULL
+    )),
+    mod_ord = list(tryCatch(
+      mgcv::gam(
+        Cog.Score ~ s(age, k=6) + s(QSM, k=5) + s(QSM, by = ostudy.group, k=5) +
+                    ostudy.group + osex + s(subid, bs = "re"),
+        method = "REML", data = cur_data()
+      ), error = function(e) NULL
+    )),
+    .groups = "drop"
+  )
+
+# --- Unordered: per-group smooth significance + eta² ---
+qsm_cog_bygroup_results <- qsm_bygrp_models %>%
+  filter(!map_lgl(mod_unord, is.null)) %>%
+  mutate(tidy = map(mod_unord, ~ {
+    tidy.df <- broom::tidy(.x, parametric = FALSE)
+    eta2 <- tryCatch(
+      effectsize::eta_squared(.x, partial = TRUE) %>%
+        select(Parameter, partial_eta2 = Eta2_partial),
+      error = function(e) tibble(Parameter = character(), partial_eta2 = numeric())
+    )
+    tidy.df %>% left_join(eta2, by = c("term" = "Parameter"))
+  })) %>%
+  select(ROI, Cog.Domain, tidy) %>%
+  unnest(tidy) %>%
+  filter(str_detect(term, "s\\(QSM\\)")) %>%
+  mutate(
+    study.group = str_extract(term, "TD|PS"),
+    Domain      = str_remove(Cog.Domain, "_Efficiency")
+  ) %>%
+  filter(!is.na(study.group)) %>%
+  group_by(study.group, Cog.Domain) %>%
+  mutate(p.fdr = p.adjust(p.value, "fdr")) %>%
+  ungroup() %>%
+  arrange(study.group, Cog.Domain, p.value)
+
+# --- Ordered: difference smooth (PS - TD) - formal interaction test + eta² ---
+qsm_bygrp_diff_results <- qsm_bygrp_models %>%
+  filter(!map_lgl(mod_ord, is.null)) %>%
+  mutate(tidy = map(mod_ord, ~ {
+    tidy.df <- broom::tidy(.x, parametric = FALSE)
+    eta2 <- tryCatch(
+      effectsize::eta_squared(.x, partial = TRUE) %>%
+        select(Parameter, partial_eta2 = Eta2_partial),
+      error = function(e) tibble(Parameter = character(), partial_eta2 = numeric())
+    )
+    tidy.df %>% left_join(eta2, by = c("term" = "Parameter"))
+  })) %>%
+  select(ROI, Cog.Domain, tidy) %>%
+  unnest(tidy) %>%
+  filter(str_detect(term, "ostudy\\.groupPS")) %>%
+  mutate(Domain = str_remove(Cog.Domain, "_Efficiency")) %>%
+  group_by(Cog.Domain) %>%
+  mutate(p.fdr = p.adjust(p.value, "fdr")) %>%
+  ungroup() %>%
+  arrange(Cog.Domain, p.value)
+
+# Per-group smooth results: both TD and PS terms, with eta²
+cat("**Unordered model - per-group QSM smooths (each tested against zero):**\n")
+qsm_cog_bygroup_results %>%
+  select(study.group, ROI, Cog.Domain, edf, statistic, p.value, partial_eta2, p.fdr) %>%
+  arrange(Cog.Domain, ROI, study.group) %>%
+  present_results()
+
+# Ordered model: difference smooth (interaction test) with eta²
+cat("**Ordered model - PS - TD difference smooth (interaction test):**\n")
+qsm_bygrp_diff_results %>%
+  select(ROI, Cog.Domain, term, edf, statistic, p.value, partial_eta2, p.fdr) %>%
+  present_results()
+# Data no longer needed - models fitted; results extracted
+rm(df_qsm_cog_bygroup)
+```
+
+```{r qsm_cog_composite_eta, cache=TRUE, dependson="df_checkpoint"}
+# Extract results to visualize 
+df_comp_cog <- df %>%
+  pivot_longer(all_of(cog_measures$efficiency), names_to = "Cog.Domain", values_to = "Cog.Score") %>%
+  mutate(QSM = Subcortex_Total)
+
+extract_qsm_eta <- function(model) {
+  broom::tidy(model, parametric = FALSE) %>%
+    left_join(effectsize::eta_squared(model, partial = TRUE) %>%
+                select(Parameter, partial_eta2 = Eta2_partial),
+              by = c("term" = "Parameter"))
+}
+
+# Total (whole-group) main effect: s(QSM)
+comp_total <- df_comp_cog %>%
+  group_by(Cog.Domain) %>%
+  summarise(model = list(tryCatch(
+    mgcv::gam(Cog.Score ~ s(age) + s(QSM) + osex + study.group + s(subid, bs = "re"),
+              method = "REML", data = cur_data()), error = function(e) NULL)),
+    .groups = "drop") %>%
+  filter(!map_lgl(model, is.null)) %>%
+  mutate(tidy = map(model, extract_qsm_eta)) %>%
+  select(Cog.Domain, tidy) %>% unnest(tidy) %>%
+  filter(term == "s(QSM)") %>% mutate(study.group = "Total")
+
+# Per-group (TD/PS) smooths via the unordered by-factor specification
+comp_bygrp <- df_comp_cog %>%
+  group_by(Cog.Domain) %>%
+  summarise(model = list(tryCatch(
+    mgcv::gam(Cog.Score ~ s(age, k = 6) + s(QSM, by = study.group, k = 5) +
+                study.group + osex + s(subid, bs = "re"),
+              method = "REML", data = cur_data()), error = function(e) NULL)),
+    .groups = "drop") %>%
+  filter(!map_lgl(model, is.null)) %>%
+  mutate(tidy = map(model, extract_qsm_eta)) %>%
+  select(Cog.Domain, tidy) %>% unnest(tidy) %>%
+  filter(str_detect(term, "s\\(QSM\\)")) %>%
+  mutate(study.group = str_extract(term, "TD|PS")) %>%
+  filter(!is.na(study.group))
+
+# Composite is a single pre-specified global measure (not part of the ROI FDR
+# family), so significance uses the raw p; p.fdr is set to p.value for the shared
+# asterisk logic in Figure 3 (note this in the figure legend).
+qsm_cog_composite_results <- bind_rows(comp_total, comp_bygrp) %>%
+  transmute(ROI = "Subcortex_Total", Cog.Domain,
+            Domain = str_remove(Cog.Domain, "_Efficiency"),
+            partial_eta2, p.value, p.fdr = p.value, study.group)
+
+rm(df_comp_cog, comp_total, comp_bygrp)
+```
+
+```{r qsm_bygrp_sig_scatter, fig.width=12, fig.height=5}
+# Scatter + partial-residual smooth for ROI x Domain pairs with a significant
+# PS - TD difference smooth (ordered model, p < 0.05)
+sig_bygrp <- qsm_bygrp_diff_results %>% filter(p.value < 0.05)
+
+if (nrow(sig_bygrp) > 0) {
+  sig_mods <- qsm_bygrp_models %>%
+    semi_join(sig_bygrp, by = c("ROI", "Cog.Domain")) %>%
+    filter(!map_lgl(mod_unord, is.null))
+
+  plots <- sig_mods %>%
+    slice_head(n = 6) %>%
+    mutate(
+      plot = pmap(list(mod_unord, ROI, Cog.Domain), function(m, r, c) {
+        partial_resid_plot(
+          m,
+          term      = "QSM",
+          int.term  = "study.group",
+          group.term = "subid",
+          plot.title = paste(label_roi(r), "x", label_cog(c)),
+          xlabel    = paste0(label_roi(r), " Susceptibility (ppm)"),
+          ylabel    = label_cog(c),
+          show.data = TRUE
+        ) +
+          scale_color_manual(values = group_colors, name = "Group") +
+          scale_fill_manual(values  = group_colors, name = "Group")
+      })
+    )
+
+  wrap_plots(plots$plot, ncol = 3, guides = "collect") &
+    theme(legend.position = "bottom")
+} else {
+  cat("No significant PS - TD QSM x group interactions at p < 0.05")
+}
+```
+
+#### Summary Table: Overall, PS, and TD
+
+```{r qsm_cog_summary_table}
+# Wide-format combined table: whole-group (qsm_cog_main_results) + per-group (unordered model)
+# One row per ROI x Domain; columns: edf / p / FDR / partial eta² for each of Overall, PS, TD
+# (partial_eta2 = effectsize::eta_squared(partial = TRUE))
+
+overall_stats <- qsm_cog_main_results %>%
+  select(ROI, Cog.Domain,
+    o_edf = edf, o_p = p.value, o_fdr = p.fdr, o_eta2 = partial_eta2)
+
+bygrp_wide <- qsm_cog_bygroup_results %>%
+  select(ROI, Cog.Domain, study.group, edf, p.value, p.fdr, partial_eta2) %>%
+  pivot_wider(
+    id_cols     = c(ROI, Cog.Domain),
+    names_from  = study.group,
+    values_from = c(edf, p.value, p.fdr, partial_eta2),
+    names_glue  = "{study.group}_{.value}"
+  )
+
+qsm_cog_summary <- overall_stats %>%
+  left_join(bygrp_wide, by = c("ROI", "Cog.Domain")) %>%
+  mutate(
+    Domain = str_remove(Cog.Domain, "_Efficiency"),
+    ROI    = factor(ROI, levels = rois$primary)
+  ) %>%
+  arrange(ROI, Domain) %>%
+  select(
+    ROI, Domain,
+    o_edf, o_p, o_fdr, o_eta2,
+    PS_edf, PS_p.value, PS_p.fdr, PS_partial_eta2,
+    TD_edf, TD_p.value, TD_p.fdr, TD_partial_eta2
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(., 3)))
+
+sig_rows <- which(
+  qsm_cog_summary$o_fdr    < 0.05 |
+  qsm_cog_summary$PS_p.fdr < 0.05 |
+  qsm_cog_summary$TD_p.fdr < 0.05
+)
+
+save_table(qsm_cog_summary, "table5b_qsm_cog_summary", "Table 5b: QSM-cognition overall vs by-group")
+
+qsm_cog_summary %>%
+  kable(
+    caption    = "Table 5b. QSM-Efficiency Associations: Overall, PS-Specific, and TD-Specific",
+    col.names  = c("ROI", "Domain",
+                   "EDF", "p", "FDR", "\u03b7\u00b2",
+                   "EDF", "p", "FDR", "\u03b7\u00b2",
+                   "EDF", "p", "FDR", "\u03b7\u00b2")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  add_header_above(c(" " = 2, "Overall" = 4, "PS" = 4, "TD" = 4)) %>%
+  row_spec(sig_rows, bold = TRUE, color = "darkred") %>%
+  scroll_box(width = "100%", height = "500px")
+```
+
+#### PS-Specificity Heatmap
+
+```{r qsm_cog_specificity_heatmap, fig.width=10, fig.height=5}
+qsm_cog_bygroup_results %>%
+  mutate(
+    neg_log_p = pmin(-log10(p.value), 4),
+    sig = case_when(p.fdr < 0.05 ~ "**", p.value < 0.05 ~ "*", TRUE ~ "")
+  ) %>%
+  ggplot(aes(x = Domain, y = ROI, fill = neg_log_p)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(aes(label = sig), size = 4, vjust = 0.75) +
+  scale_fill_gradient(low = "white", high = "#d73027",
+                      name = expression(-log[10](italic(p))),
+                      limits = c(0, 4)) +
+  scale_x_discrete(labels = cog_labels) +
+  scale_y_discrete(labels = roi_labels) +
+  facet_wrap(~ study.group, ncol = 2) +
+  labs(
+    title    = "QSM-Efficiency Associations by Diagnostic Group",
+    subtitle = "** FDR < 0.05; * p < 0.05 uncorrected",
+    x = NULL, y = NULL
+  ) +
+  theme(
+    axis.text.x      = element_text(angle = 35, hjust = 1),
+    strip.background = element_blank(),
+    legend.position  = "right"
+  )
+```
+
+### Age x QSM
+This tests whether the QSM-cognition association changes with age, regardless of group. This is a two-way interaction test (age x QSM) using a tensor product smooth.  
+
+```{r qsm_cognition_age_interaction, cache=TRUE, dependson="df_checkpoint", eval=FALSE}
+qsm_cog_ageint_models <- df_qsm_cog %>%
+  group_by(ROI, Cog.Domain) %>%
+  summarise(
+    model = list(tryCatch(
+      mgcv::gam(
+        QSM ~ s(age,k=6) + s(Cog.Score,k=4) + ti(age,Cog.Score,k=4) + osex + study.group + s(subid, bs="re"),
+        method = "REML",
+        data = cur_data()
+      ), error = function(e) NULL
+    )),
+    .groups = "drop"
+  ) %>%
+  filter(!map_lgl(model, is.null))
+
+qsm_cog_ageint_results <- qsm_cog_ageint_models %>%
+  mutate(
+    tidy = map(model, ~ broom::tidy(.x, parametric = FALSE))
+  ) %>%
+  select(-model) %>%
+  unnest(tidy) %>%
+  filter(str_detect(term, "ti")) %>%
+  group_by(Cog.Domain) %>%
+  mutate(p.fdr = p.adjust(p.value, "fdr")) %>%
+  ungroup() %>%
+  arrange(Cog.Domain, p.value)
+
+qsm_cog_ageint_results %>%
+  filter(p.value < 0.05) %>%
+  present_results()
+
+sig_interactions <- qsm_cog_ageint_results %>%
+  filter(p.fdr < 0.05)
+
+if (nrow(sig_interactions) > 0) {
+  sig_models <- qsm_cog_ageint_models %>%
+    semi_join(sig_interactions, by = c("ROI", "Cog.Domain"))
+
+  plots <- sig_models %>%
+    mutate(
+      plot = pmap(
+        list(model, ROI, Cog.Domain),
+        function(m, r, c) {
+          partial_resid_plot(
+            m, term = "age", group.term = "subid",
+            plot.title = paste(label_roi(r), "-", label_cog(c)),
+            xlabel = "Age (years)", ylabel = label_cog(c),
+            show.data = TRUE, add.intercept = TRUE
+          )
+        }
+      )
+    )
+
+  wrap_plots(plots$plot, ncol = 3)
+} else {
+  cat("No significant QSM x age interactions at FDR < 0.05")
+}
+# df_qsm_cog done - last analysis to use it
+rm(qsm_cog_ageint_models, qsm_cog_ageint_results, df_qsm_cog)
+gc()
+```
+
+# Figure 3: Cognitive effects
+
+```{r figure_3_cognition, fig.width=15, fig.height=16}
+# Figure 3 (cognitive effects): A group differences, B iron-cognition association, C ROI-by-domain heatmap
+
+# Domain display order (Overall first, matching earlier figures)
+cog_domain_order <- c("Overall_Efficiency", "SocialCog_Efficiency",
+                      "Memory_Efficiency",   "Executive_Efficiency",
+                      "Complex_Efficiency")
+
+# --- Panel A: Group differences in cognition ---
+cog_grp_preds_fig <- cog_grp_preds %>%
+  mutate(Domain = factor(label_cog(Cog.Domain), levels = label_cog(cog_domain_order)))
+
+cog_grp_annot_fig <- cog_grp_annot %>%
+  mutate(Domain = factor(label_cog(Cog.Domain), levels = levels(cog_grp_preds_fig$Domain)))
+
+p4_A <- ggplot(cog_grp_preds_fig,
+               aes(x = Domain, y = Cog_mean, fill = study.group)) +
+  geom_errorbar(aes(ymin = Cog_lower, ymax = Cog_upper),
+                position = position_dodge(width = 0.5),
+                width = 0.1, color = "grey30", linewidth = 0.8) +
+  geom_point(shape = 21, size = 4, color = "grey30", stroke = 1,
+             position = position_dodge(width = 0.5)) +
+  geom_text(data = cog_grp_annot_fig,
+            aes(x = Domain, y = y_top, label = label),
+            inherit.aes = FALSE, parse = TRUE,
+            vjust = -0.4, size = 2.8, color = "grey20") +
+  scale_fill_manual(values = group_colors,
+                    labels = c("TD" = "Typically Developing", "PS" = "Psychosis Spectrum"),
+                    name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.18))) +
+  labs(x = NULL, y = "Adjusted Performance",
+       title = "Group differences in cognition") +
+  theme(legend.position = "top")
+
+# --- Panel B: Iron-cognition heatmap (whole-subcortex composite atop the ROI set) ---
+# Composite (Subcortex_Total) is placed at the top row; ROI ordering otherwise
+# follows the conceptual striatum -> pallidum -> midbrain sequence.
+roi_order_heat <- c("Subcortex_Total", roi_order_conceptual)
+
+# Whole-group (Total) partial η²: ROI set + whole-subcortex composite
+eta_overall <- qsm_cog_main_results %>%
+  filter(!is.na(partial_eta2)) %>%
+  transmute(ROI, Cog.Domain, Domain = str_remove(Cog.Domain, "_Efficiency"),
+            partial_eta2, p.value, p.fdr, study.group = "Total") %>%
+  bind_rows(qsm_cog_composite_results %>% filter(study.group == "Total") %>%
+              select(ROI, Cog.Domain, Domain, partial_eta2, p.value, p.fdr, study.group))
+
+# Per-group (TD/PS) partial η²: ROI set + composite
+eta_bygroup <- qsm_cog_bygroup_results %>%
+  filter(!is.na(partial_eta2)) %>%
+  transmute(ROI, Cog.Domain, Domain = str_remove(Cog.Domain, "_Efficiency"),
+            partial_eta2, p.value, p.fdr, study.group) %>%
+  bind_rows(qsm_cog_composite_results %>% filter(study.group %in% c("TD", "PS")) %>%
+              select(ROI, Cog.Domain, Domain, partial_eta2, p.value, p.fdr, study.group))
+
+cog_domain_strip_order <- c("Overall", "SocialCog", "Memory", "Executive", "Complex")
+
+eta_combined <- bind_rows(eta_overall, eta_bygroup) %>%
+  mutate(
+    ROI         = factor(ROI, levels = roi_order_heat[roi_order_heat %in% ROI]),
+    study.group = factor(study.group, levels = c("Total", "TD", "PS")),
+    Domain      = factor(Domain, levels = cog_domain_strip_order),
+    sig_level   = ifelse(!is.na(p.fdr) & p.fdr < 0.05, "FDR < 0.05", "ns")
+  )
+
+heat_strip_labels <- c(
+  "Total" = "<span style='color:#000000;'>Total</span>",
+  "TD"    = "<span style='color:#1B9E77;'>Typically Developing</span>",
+  "PS"    = "<span style='color:#D55E00;'>Psychosis Spectrum</span>"
+)
+
+eta_heat <- eta_combined %>%
+  mutate(
+    roi_label = factor(roi_labels[as.character(ROI)],
+                       levels = rev(roi_labels[roi_order_heat[roi_order_heat %in% levels(ROI)]])),
+    ast = ifelse(!is.na(p.fdr) & p.fdr < 0.05, "*", "")
+  )
+
+p4_B <- ggplot(eta_heat,
+               aes(x = Domain, y = roi_label, fill = partial_eta2)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = ast), color = "black", size = 5, vjust = 0.75) +
+  facet_wrap(~ study.group, nrow = 1, labeller = as_labeller(heat_strip_labels)) +
+  scale_fill_distiller(palette = "YlOrRd", direction = 1,
+                       limits = c(0, NA), na.value = "grey95",
+                       name = expression(eta[partial]^2)) +
+  scale_x_discrete(labels = cog_labels) +
+  labs(x = NULL, y = NULL,
+       title = expression("Iron-cognition associations")) +
+  theme(axis.text.x      = element_text(angle = 35, hjust = 1),
+        strip.background  = element_blank(),
+        strip.text        = element_markdown(),
+        legend.position   = "right")
+
+# --- Assemble Figure 3 ---
+p4_A <- p4_A + labs(tag = "A")
+p4_B <- p4_B + labs(tag = "C")
+p_main[[1]] <- p_main[[1]] + labs(tag = "B")  # tag the scatter block's top-left panel
+fig3 <- p4_A / p_main / p4_B +
+  plot_layout(heights = c(1.0, 0.75, 1.5)) &
+  theme(plot.tag = element_text(face = "bold", size = 14))
+fig3
+save_fig(fig3, "fig3_cognition", width = 15, height = 15)
+```
+
+# Mediation Analysis
+
+Does subcortical iron (susceptibility) mediate the association between group and cognition, allowing the indirect effect to be moderated by the observed nonlinear age effects of susceptibility? Due to the nonlinear effects of age, we cannon fit using `mediate`. Instead, we have to fit using a Bayesian spline model.
+
+## Group --> QSM --> Cognition, Moderated by Age
+
+The indirect effect of diagnosis on cognition via QSM may vary nonlinearly with age. We fit a bivariate Bayesian model with by-group spline age trajectories for both paths, then compute the conditional indirect effect as a curve over age. Mediation is conducted on the whole-subcortex composite (Subcortex_Total) only - no ROI gating - and reported for each of the five cognitive domains.
+
+```{r brms_modmed, cache=FALSE, eval=TRUE}
+# Run this chunk interactively (not during knit) to fit all moderated mediation models.
+# Results are saved to Models/med_results_modmed.rds and loaded automatically during knit.
+#
+# Model: bivariate Bayesian GAM (brms) encoding the product-of-coefficients estimator.
+#   a-path: Group -> QSM trajectory difference (age-varying, by-group spline)
+#   b-path: QSM -> Cognition (linear, constant across age)
+#   indirect(age) = a-path(age) x b-path  [age-moderated indirect effect]
+#   `dataset` is NOT included: cohorts share identical protocol/scanner/battery and
+#   their age ranges are near-collinear with `s(age, by=study.group)` anyway.
+# Note: This code was generated by Claude (Opus 4.8; https://www.anthropic.com/) and checked by the user. 
+dir.create("Models", showWarnings = FALSE)
+
+# ----- Data preparation -------------------------------------------------------
+# Mediation is conducted on the whole-subcortex composite (Subcortex_Total).
+
+df_med_prep_modmed <- df %>%
+  select(subid, age, osex, study.group, Subcortex_Total,
+         all_of(cog_measures$efficiency)) %>%
+  pivot_longer(cols = all_of(cog_measures$efficiency),
+               names_to = "Cog.Domain", values_to = "Cog.Score")
+
+# ----- Analysis grid: global composite x all cognitive domains ----------------
+analysis_grid_modmed <- expand_grid(
+  ROI_Name   = rois$global,                 # Subcortex_Total
+  Cog_Domain = cog_measures$efficiency
+)
+cat(sprintf("Analysis grid: %d Subcortex_Total x cognitive-domain pairs\n",
+            nrow(analysis_grid_modmed)))
+
+# ----- Model fitting function ------------------------------------------------
+run_spline_modmed <- function(ROI_Name, Cog_Domain, dataset) {
+  curr_data <- dataset %>%
+    filter(Cog.Domain == Cog_Domain) %>%
+    drop_na(all_of(c("Cog.Score", ROI_Name, "age", "osex", "study.group"))) %>%
+    rename(QSM = all_of(ROI_Name), Cog = Cog.Score) %>%
+    mutate(study.group = factor(study.group, levels = c("TD", "PS")))
+
+  # Reference sex: use the reference level of the ordered factor 
+  ref_sex <- levels(curr_data$osex)[1]
+
+  tryCatch({
+    brms_fit <- brm(
+      # a-path model: group x age-varying iron trajectory
+      bf(QSM ~ study.group + s(age, by = study.group) + osex + (1 | subid)) +
+      # b-path model: iron -> cognition, controlling for group and age trajectory
+      bf(Cog ~ QSM + study.group + s(age, by = study.group) + osex + (1 | subid)) +
+      set_rescor(FALSE),   # separate residual variances; correlation absorbed by shared predictors
+      data       = curr_data,
+      family     = gaussian(),
+      backend    = "cmdstanr",
+      chains     = 4,
+      cores      = 4,
+      iter       = n_brms_iter,
+      warmup     = n_brms_warmup,
+      seed       = 1234,
+      control    = list(adapt_delta = 0.95),
+      file       = sprintf("Models/modmed_%s_%s", ROI_Name, Cog_Domain),
+      file_refit = "on_change",
+      refresh    = 500
+    )
+
+    # b-path: posterior draws for the QSM -> Cog coefficient
+    draws     <- as_draws_df(brms_fit)
+    b_path_df <- draws %>% select(.draw, b_path = b_Cog_QSM)
+
+    # Prediction grid for the a-path: marginalise over subjects (re_formula = NA),
+    # hold sex at reference level
+    age_seq   <- seq(floor(min(curr_data$age)), ceiling(max(curr_data$age)), by = .2)
+    pred_grid <- expand_grid(
+      age         = age_seq,
+      study.group = factor(c("TD", "PS"), levels = c("TD", "PS")),
+      osex        = ordered(ref_sex, levels = levels(curr_data$osex)),
+      subid       = "new_subject"
+    )
+
+    # Get posterior predictive means for QSM across age for each group
+    m_preds <- pred_grid %>%
+      add_epred_draws(brms_fit, resp = "QSM", re_formula = NA, allow_new_levels = TRUE) %>%
+      ungroup() %>%
+      select(age, study.group, .draw, QSM_pred = .epred)
+
+    # Age-moderated indirect effect: delta-QSM(age) x b-path
+    med_curve <- m_preds %>%
+      pivot_wider(names_from = study.group, values_from = QSM_pred) %>%
+      left_join(b_path_df, by = ".draw") %>%
+      mutate(
+        a_path_local    = PS - TD,              # PS - TD gap in QSM at this age
+        indirect_effect = a_path_local * b_path # product-of-coefficients indirect effect
+      ) %>%
+      group_by(age) %>%
+      summarise(
+        Mediation_Est = mean(indirect_effect),
+        CI_lo         = quantile(indirect_effect, 0.025),
+        CI_hi         = quantile(indirect_effect, 0.975),
+        Prob_Dir      = max(mean(indirect_effect > 0), mean(indirect_effect < 0)),
+        .groups       = "drop"
+      ) %>%
+      mutate(
+        ROI_Name   = ROI_Name,
+        Cog_Domain = Cog_Domain,
+        pseudo_p   = 2 * (1 - Prob_Dir)
+      )
+
+    rm(brms_fit, draws, m_preds, pred_grid)
+    gc()
+    return(med_curve)
+
+  }, error = function(e) {
+    message(sprintf("Error in %s x %s: %s", ROI_Name, Cog_Domain, e$message))
+    tibble()
+  })
+}
+
+# ----- Run -------------------------------------------------------------------
+med_results.modmed <- analysis_grid_modmed %>%
+  pmap(~ run_spline_modmed(..1, ..2, dataset = df_med_prep_modmed)) %>%
+  list_rbind()
+
+saveRDS(med_results.modmed, "Models/med_results_modmed.rds")
+```
+
+```{r brms_modmed_load, cache=FALSE, dependson="df_checkpoint"}
+modmed_path <- "Models/med_results_modmed.rds"
+if (file.exists(modmed_path)) {
+  # Restrict to the whole-subcortex composite. (Cached results may still contain
+  # other ROIs from earlier runs; re-running brms_modmed regenerates global-only.)
+  med_results.modmed <- readRDS(modmed_path) %>%
+    filter(ROI_Name == "Subcortex_Total")
+} else {
+  cat("NOTE: Moderated mediation results not yet available.",
+      "Run the `brms_modmed` chunk interactively to fit models and cache results.\n")
+  med_results.modmed <- tibble()
+}
+```
+
+```{r brms_modmed_viz, fig.width=18, fig.height=4}
+# Cognitive-domain display order: Overall first, then the rest
+dom_levels <- c("Overall_Efficiency",
+                setdiff(cog_measures$efficiency, "Overall_Efficiency"))
+
+# Figure: conditional indirect effect for Subcortex Total, one panel per domain
+if (exists("med_results.modmed") && nrow(med_results.modmed) > 0) {
+  # Age-varying conditional indirect effect, one domain per row (shared x-axis).
+  md_modmed <- med_results.modmed %>%
+    mutate(Domain = factor(label_cog(Cog_Domain), levels = label_cog(dom_levels)),
+           sig = CI_lo > 0 | CI_hi < 0)
+
+  # Onset: earliest age at which the indirect effect becomes credible, per domain
+  onset_modmed <- md_modmed %>%
+    group_by(Domain) %>%
+    summarise(onset = if (any(sig)) min(age[sig]) else NA_real_, .groups = "drop") %>%
+    filter(!is.na(onset))
+
+  p_modmed <- ggplot(md_modmed, aes(x = age, y = Mediation_Est)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+    # full curve in grey (not credible)
+    geom_ribbon(aes(ymin = CI_lo, ymax = CI_hi), fill = "grey70", alpha = 0.35) +
+    geom_line(color = "grey55", linewidth = 0.8) +
+    # credible portion in colour (95% CI excludes 0)
+    geom_ribbon(data = dplyr::filter(md_modmed, sig),
+                aes(ymin = CI_lo, ymax = CI_hi), fill = "#d73027", alpha = 0.30) +
+    geom_line(data = dplyr::filter(md_modmed, sig), color = "#d73027", linewidth = 1.1) +
+    # onset marker + age label
+    geom_vline(data = onset_modmed, aes(xintercept = onset),
+               linetype = "dotted", color = "grey30", linewidth = 0.5) +
+    geom_text(data = onset_modmed,
+              aes(x = onset, y = Inf, label = paste0(round(onset, 1), " yr")),
+              inherit.aes = FALSE, hjust = -0.05, vjust = 1.5, size = 3, color = "grey20") +
+    facet_wrap(~ Domain, ncol = 1, scales = "free_y", strip.position = "right") +
+    labs(
+      title = "Age-dependent mediation effect",
+      x = "Age (years)", y = "Indirect effect (ppm x performance units)"
+    ) +
+    theme(strip.background   = element_blank(),
+          strip.text.y.right = element_text(angle = 0),
+          panel.spacing.y    = unit(3, "pt"))
+
+  p_modmed
+  save_fig(p_modmed, "fig_modmed_global", width = 6, height = 9)
+} else {
+  cat("Moderated mediation results not available.\n")
+}
+
+modmed_stats_table <- med_results.modmed %>%
+  group_by(Cog_Domain) %>%
+  summarise(
+    # Cap at age 28 so the peak isn't driven by the sparse upper tail.
+    # which.max(abs(...)) finds the index of the largest effect up to age 28
+    Ref_Idx = which.max(abs(Mediation_Est[age <= 28])),
+
+    Age_of_Peak        = age[Ref_Idx],
+    Peak_Mediation_Est = Mediation_Est[Ref_Idx],
+    Peak_CI_lo         = CI_lo[Ref_Idx],
+    Peak_CI_hi         = CI_hi[Ref_Idx],
+
+    # Onset: first age at which the credible interval excludes zero
+    Age_of_Onset = if (any(CI_lo > 0 | CI_hi < 0)) age[min(which(CI_lo > 0 | CI_hi < 0))] else NA,
+
+    # Probability of direction across the whole age range
+    Max_Prob_Dir = max(Prob_Dir),
+    pseudo_p     = 2 * (1 - Max_Prob_Dir),
+
+    .groups = "drop"
+  )
+
+modmed_final_report <- modmed_stats_table %>%
+  mutate(
+    Evidence = case_when(
+      Max_Prob_Dir >= 0.99  ~ "Strong",
+      Max_Prob_Dir >= 0.975 ~ "Moderate",
+      Max_Prob_Dir >= 0.95  ~ "Suggestive",
+      TRUE                  ~ "Weak"
+    ),
+    Peak_95_CI = sprintf("[%0.3f, %0.3f]", Peak_CI_lo, Peak_CI_hi),
+    # Benjamini-Hochberg FDR across the five domains
+    fdr_p   = p.adjust(pseudo_p, method = "fdr"),
+    FDR_Sig = if_else(fdr_p < 0.05, "*", ""),
+    Domain  = factor(label_cog(Cog_Domain), levels = label_cog(dom_levels))
+  ) %>%
+  arrange(Domain) %>%
+  select(Domain, Age_of_Onset, Peak_Mediation_Est, Peak_95_CI,
+         Max_Prob_Dir, Evidence, FDR_Sig, fdr_p)
+
+save_table(modmed_final_report, "table6_modmed_global",
+           "Moderated mediation: Subcortex Total -> cognition by domain")
+
+modmed_final_report %>%
+  mutate(
+    Peak_Mediation_Est = round(Peak_Mediation_Est, 3),
+    Max_Prob_Dir       = round(Max_Prob_Dir, 3)
+  ) %>%
+  select(-fdr_p) %>%
+  kbl(
+    caption   = "Moderated mediation: Subcortex Total -> cognition, by domain",
+    col.names = c("Cognitive Domain", "Age of Onset", "Peak Indirect Effect",
+                  "95% Credible Interval", "Max P(Direction)", "Evidence", "FDR"),
+    align     = c("l","c","r","c","r","l","c")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  row_spec(which(modmed_final_report$FDR_Sig == "*"), bold = TRUE, color = "darkred")
+```
+
+# Figure 4: Mediation
+
+```{r figure_4_mediation, fig.width=14, fig.height=7}
+# Figure 4 (mediation): A path model, B age-dependent conditional indirect effect
+
+# --- Panel C: Conceptual path diagram (Inkscape template) ---
+# Representative pathway: Subcortex Total -> Overall Cognition
+# Uses real coefficients from the brms moderated mediation model
+
+# --- Panel A path values (computed from the fitted results so the labels never go stale) ---
+.mm_ov  <- med_results.modmed %>% filter(Cog_Domain == "Overall_Efficiency")
+.mm_sig <- .mm_ov %>% filter(CI_lo > 0 | CI_hi < 0)
+.onset  <- if (nrow(.mm_sig)) min(.mm_sig$age) else NA_real_
+.peak   <- .mm_ov %>% filter(age <= 28) %>% slice(which.max(abs(Mediation_Est)))
+.pdir   <- max(.mm_ov$Prob_Dir, na.rm = TRUE)
+
+.fit_path <- "Models/modmed_Subcortex_Total_Overall_Efficiency.rds"
+if (file.exists(.fit_path)) {
+  .fe <- brms::fixef(readRDS(.fit_path),
+                     probs = c(0.0005, 0.005, 0.025, 0.975, 0.995, 0.9995))
+  # Significance from the posterior: a-path (constant group->iron) is n.s.; the effect
+  # is carried by the age moderation, reflected in the credible indirect-effect box.
+  .star <- function(r) {
+    e <- .fe[r, ]
+    if (e[["Q0.05"]] > 0 || e[["Q99.95"]] < 0) "***"
+    else if (e[["Q0.5"]] > 0 || e[["Q99.5"]] < 0) "**"
+    else if (e[["Q2.5"]] > 0 || e[["Q97.5"]] < 0) "*"
+    else " (n.s.)"
+  }
+  a_lab <- sprintf("Path a: β = %.3f%s\nGroup -> Iron (age-moderated)",
+                   .fe["QSM_study.groupPS", "Estimate"], .star("QSM_study.groupPS"))
+  b_lab <- sprintf("Path b: β = %.2f%s\nIron -> Cognition",
+                   .fe["Cog_QSM", "Estimate"], .star("Cog_QSM"))
+  d_lab <- sprintf("Direct: β = %.3f%s\n(c' path)",
+                   .fe["Cog_study.groupPS", "Estimate"], .star("Cog_study.groupPS"))
+} else {
+  a_lab <- "Path a\nGroup -> Iron"; b_lab <- "Path b\nIron -> Cognition"; d_lab <- "Direct (c' path)"
+}
+ind_lab <- sprintf("Indirect effect = a x b x f(Age)\nPeak: %.3f [%.3f, %.3f]\nOnset age: %.1f yr | P(dir) = %.3f",
+                   .peak$Mediation_Est, .peak$CI_lo, .peak$CI_hi, .onset, .pdir)
+
+# Box positions (x, y centers) and sizes
+boxes <- tibble(
+  label = c("DIAGNOSTIC\nGROUP\n(TD = 0, PS = 1)",
+            "SUBCORTICAL IRON\nACCUMULATION\n(Global subcortical QSM)",
+            "OVERALL COGNITIVE\nPERFORMANCE"),
+  x     = c(0, 5, 10),
+  y     = c(0, 4, 0),
+  w     = c(3.2, 3.8, 3.2),
+  h     = c(1.8, 1.8, 1.5)
+)
+
+# Moderator node
+mod_node <- tibble(label = "AGE\n(8-31 years)", x = 2.5, y = 7, r = 1.2)
+
+# Arrow definitions
+arrows <- tibble(
+  x    = c(1.6,  6.9,  1.6),
+  y    = c(0.0,  4.0,  0.0),
+  xend = c(3.1,  8.4,  8.4),
+  yend = c(4.0,  0.75, 0.0),
+  lty  = c("solid", "solid", "solid"),
+  col  = c("grey30", "grey30", "grey50")
+)
+
+# Arrow labels (a/b/direct pulled dynamically above)
+arrow_labels <- tibble(
+  label = c(a_lab, b_lab, d_lab),
+  x     = c(1.6, 8.5, 5.0),
+  y     = c(2.4, 2.8, -0.9),
+  hjust = c(0, 1, 0.5),
+  size  = c(3, 3, 3)
+)
+
+# Indirect effect annotation (pulled dynamically above)
+indirect_label <- tibble(
+  label = ind_lab,
+  x = 5, y = -2.2
+)
+
+p4_C <- ggplot() +
+  # Boxes
+  geom_rect(data = boxes,
+            aes(xmin = x - w/2, xmax = x + w/2, ymin = y - h/2, ymax = y + h/2),
+            fill = "white", color = "grey20", linewidth = 0.8) +
+  geom_text(data = boxes, aes(x = x, y = y, label = label),
+            size = 3, lineheight = 0.9, fontface = "bold") +
+  # Moderator ellipse (approximate with a wider rect with rounded corners)
+  annotate("rect", xmin = mod_node$x - 1.5, xmax = mod_node$x + 1.5,
+           ymin = mod_node$y - 0.8, ymax = mod_node$y + 0.8,
+           fill = "#f0f0f0", color = "grey30", linewidth = 0.6) +
+  annotate("text", x = mod_node$x, y = mod_node$y, label = mod_node$label,
+           size = 3, fontface = "bold.italic", lineheight = 0.9) +
+  # Moderation arrow (dashed, from Age node to Path a midpoint)
+  annotate("segment", x = 2.5, y = 6.2, xend = 2.2, yend = 2.8,
+           arrow = arrow(length = unit(0.12, "inches"), type = "closed"),
+           linetype = "dashed", color = "#b35806", linewidth = 0.7) +
+  annotate("text", x = 1.4, y = 4.8, label = "Moderates\nPath a",
+           size = 2.8, color = "#b35806", fontface = "italic", lineheight = 0.9) +
+  # Path arrows
+  geom_segment(data = arrows,
+               aes(x = x, y = y, xend = xend, yend = yend, linetype = lty, color = col),
+               arrow = arrow(length = unit(0.15, "inches"), type = "closed"),
+               linewidth = 0.9, show.legend = FALSE) +
+  scale_color_identity() +
+  scale_linetype_identity() +
+  # Path labels
+  geom_text(data = arrow_labels,
+            aes(x = x, y = y, label = label, hjust = hjust),
+            size = arrow_labels$size, lineheight = 0.85, color = "grey20") +
+  # Indirect effect summary box
+  annotate("rect", xmin = 2.5, xmax = 7.5, ymin = -3.1, ymax = -1.3,
+           fill = "#fffbe6", color = "#b35806", linewidth = 0.5, linetype = "dashed") +
+  geom_text(data = indirect_label, aes(x = x, y = y, label = label),
+            size = 2.8, lineheight = 1, color = "#b35806") +
+  # Styling
+  coord_cartesian(xlim = c(-2, 12), ylim = c(-3.5, 8.5), clip = "off") +
+  labs(title = "Representative mechanistic pathway: Global subcortical -> Overall Cognition") +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5, size = 11, face = "bold"),
+        plot.margin = margin(5, 5, 5, 5))
+
+# --- Assemble Figure 4 ---
+if (exists("med_results.modmed") && nrow(med_results.modmed) > 0) {
+  fig4 <- (p4_C | p_modmed) +
+    plot_layout(widths = c(2, 1)) +
+    plot_annotation(tag_levels = "A",
+                    theme = theme(plot.tag = element_text(face = "bold", size = 14)))
+  print(fig4)
+  save_fig(fig4, "fig4_mediation", width = 14, height = 6.5)
+} else {
+  message("med_results.modmed not available -- Figure 4 (mediation) skipped.")
+}
+```
+
+# Region-wise Mediation (SN & Pallidum)
+
+Region-wise moderated mediation for the two FDR-significant divergence regions (substantia nigra and
+pallidum), paralleling the whole-subcortex analysis (Table 4 / Figure 4) and requested in review.
+Fits reuse the identical model/priors as the global analysis and the cached brms models in `Models/`
+(`file_refit = "on_change"`), so re-knitting does not refit.
+
+```{r modmed_region_sn_pallidum, cache=FALSE, dependson="brms_modmed"}
+region_rois_mm <- c("SN_Total", "Pallidum_Total")
+reg_lab_mm     <- c(SN_Total = "Substantia Nigra", Pallidum_Total = "Pallidum")
+
+df_med_prep_region <- df %>%
+  select(subid, age, osex, study.group, all_of(region_rois_mm),
+         all_of(cog_measures$efficiency)) %>%
+  pivot_longer(all_of(cog_measures$efficiency),
+               names_to = "Cog.Domain", values_to = "Cog.Score")
+
+med_results.modmed_region <- expand_grid(ROI_Name   = region_rois_mm,
+                                          Cog_Domain = cog_measures$efficiency) %>%
+  pmap(~ run_spline_modmed(..1, ..2, dataset = df_med_prep_region)) %>%
+  list_rbind()
+
+# Summary: peak indirect effect, onset, pd, and FDR within region across the 5 domains
+modmed_region_summary <- med_results.modmed_region %>%
+  arrange(ROI_Name, Cog_Domain, age) %>%
+  group_by(ROI_Name, Cog_Domain) %>%
+  summarise(
+    Ref          = which.max(abs(Mediation_Est[age <= 28])),
+    Age_of_Peak  = age[age <= 28][Ref],
+    Peak_Est     = Mediation_Est[age <= 28][Ref],
+    Peak_CI_lo   = CI_lo[age <= 28][Ref],
+    Peak_CI_hi   = CI_hi[age <= 28][Ref],
+    Age_of_Onset = if (any(CI_lo > 0 | CI_hi < 0)) age[min(which(CI_lo > 0 | CI_hi < 0))] else NA_real_,
+    pd           = max(Prob_Dir),
+    pseudo_p     = 2 * (1 - max(Prob_Dir)),
+    .groups = "drop"
+  ) %>%
+  group_by(ROI_Name) %>% mutate(FDR = p.adjust(pseudo_p, "fdr")) %>% ungroup() %>%
+  transmute(
+    Region       = unname(reg_lab_mm[ROI_Name]),
+    Domain       = factor(label_cog(Cog_Domain), levels = label_cog(cog_table_order)),
+    Age_of_Onset = round(Age_of_Onset, 1),
+    Peak_Est     = round(Peak_Est, 3),
+    CI_lo        = round(Peak_CI_lo, 3), CI_hi = round(Peak_CI_hi, 3),
+    pd           = round(pd, 3), FDR = round(FDR, 3)
+  ) %>%
+  arrange(factor(Region, levels = unname(reg_lab_mm)), Domain)
+
+save_table(modmed_region_summary, "supptable_modmed_sn_pallidum",
+           "Region-wise moderated mediation (SN, pallidum): peak indirect effect, onset, pd, FDR")
+
+# Supplementary figure: age-varying conditional indirect effect (parallels Figure 4B)
+md_region <- med_results.modmed_region %>%
+  mutate(Domain = factor(label_cog(Cog_Domain), levels = label_cog(cog_table_order)),
+         Region = factor(unname(reg_lab_mm[ROI_Name]), levels = unname(reg_lab_mm)),
+         sig    = CI_lo > 0 | CI_hi < 0)
+onset_region <- md_region %>% group_by(Region, Domain) %>%
+  summarise(onset = if (any(sig)) min(age[sig]) else NA_real_, .groups = "drop") %>%
+  filter(!is.na(onset))
+
+p_modmed_region <- ggplot(md_region, aes(age, Mediation_Est)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_ribbon(aes(ymin = CI_lo, ymax = CI_hi), fill = "grey70", alpha = 0.35) +
+  geom_line(color = "grey55", linewidth = 0.8) +
+  geom_ribbon(data = dplyr::filter(md_region, sig), aes(ymin = CI_lo, ymax = CI_hi),
+              fill = "#d73027", alpha = 0.30) +
+  geom_line(data = dplyr::filter(md_region, sig), color = "#d73027", linewidth = 1.1) +
+  geom_vline(data = onset_region, aes(xintercept = onset), linetype = "dotted",
+             color = "grey30", linewidth = 0.5) +
+  geom_text(data = onset_region, aes(x = onset, y = Inf, label = paste0(round(onset, 1), " yr")),
+            inherit.aes = FALSE, hjust = -0.05, vjust = 1.5, size = 3, color = "grey20") +
+  facet_grid(Domain ~ Region, scales = "free_y", switch = "y") +
+  labs(x = "Age (years)", y = "Indirect effect (ppm × performance units)",
+       title = "Region-wise age-moderated mediation") +
+  theme(strip.background = element_blank(), strip.placement = "outside",
+        panel.spacing = unit(4, "pt"))
+
+save_fig(p_modmed_region, "suppfig_modmed_SN_Pallidum", width = 7.5, height = 10)
+p_modmed_region
+```
+
+# Sensitivity Analyses {.tabset}
+
+Checks dataset effects (EF vs MOTIVE), longitudinal reliability (ICC), and within-group replication.
+
+## Dataset Differences
+
+```{r sensitivity_dataset_differences}
+dataset_models <- df %>%
+  pivot_longer(all_of(rois$cit_all), names_to = "ROI", values_to = "QSM") %>%
+  group_by(ROI) %>%
+  summarise(
+    model = list(tryCatch(
+      mgcv::gam(
+        QSM ~ s(age) + osex + study.group + dataset + s(subid, bs="re"),
+        method = "REML",
+        data = cur_data()
+      ), error = function(e) NULL
+    )),
+    .groups = "drop"
+  ) %>%
+  filter(!map_lgl(model, is.null))
+
+dataset_results <- dataset_models %>%
+  mutate(
+    tidy = map(model, ~ broom::tidy(.x, parametric = TRUE))
+  ) %>%
+  select(-model) %>%
+  unnest(tidy) %>%
+  filter(term == "datasetMOTIVE") %>%
+  mutate(p.fdr = p.adjust(p.value, "fdr")) %>%
+  arrange(p.value)
+
+dataset_results %>%
+  present_results()
+```
+
+```{r dataset_violin}
+df %>%
+  pivot_longer(all_of(rois$striatum), names_to = "ROI", values_to = "QSM") %>%
+  ggplot(aes(x = dataset, y = QSM, fill = study.group)) +
+  geom_violin(alpha = 0.5) +
+  geom_boxplot(width = 0.3, position = position_dodge(0.9)) +
+  facet_wrap(~ ROI, scales = "free_y", labeller = as_labeller(roi_labels)) +
+  scale_fill_manual(values = group_colors) +
+  labs(
+    title = "QSM by Dataset and Group",
+    x = "Dataset", y = "Susceptibility (ppm)", fill = "Group"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+### Age-Overlap Validation
+
+EF (youth) and MOTIVE (young adults) share a narrow age range. Here we (1) visualise the
+trajectories of both datasets across the full age span, and (2) formally test whether there is a
+residual dataset main effect or a dataset x group interaction **within the overlapping age window
+only**. Non-significant results there confirm that the two datasets can be pooled.
+
+```{r sensitivity_overlap_viz, fig.height=8, fig.width=12}
+# Identify overlap zone dynamically from data
+age_bounds <- df %>%
+  group_by(dataset) %>%
+  summarise(lo = min(age, na.rm = TRUE), hi = max(age, na.rm = TRUE), .groups = "drop")
+
+overlap_lo <- max(age_bounds$lo)
+overlap_hi <- min(age_bounds$hi)
+
+cat(sprintf("Overlap zone: %.1f - %.1f years\n", overlap_lo, overlap_hi))
+cat(sprintf("Sessions in overlap: %d of %d total\n",
+            sum(df$age >= overlap_lo & df$age <= overlap_hi, na.rm = TRUE), nrow(df)))
+df %>%
+  mutate(in_overlap = age >= overlap_lo & age <= overlap_hi) %>%
+  count(dataset, study.group, in_overlap) %>%
+  filter(in_overlap) %>%
+  select(-in_overlap) %>%
+  kable(caption = "Sessions per group in overlap zone") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# Full-span trajectories by dataset, with overlap zone shaded
+df_long %>%
+  ggplot(aes(x = age, y = QSM, color = dataset)) +
+  annotate("rect",
+           xmin = overlap_lo, xmax = overlap_hi,
+           ymin = -Inf,       ymax = Inf,
+           fill = "gold", alpha = 0.20) +
+  geom_point(alpha = 0.10, size = 0.7) +
+  geom_smooth(method = "gam", formula = y ~ s(x, k = 5),
+              se = TRUE, linewidth = 1.3) +
+  facet_wrap(~ ROI, scales = "free_y", ncol = 4, labeller = as_labeller(roi_labels)) +
+  scale_color_manual(values = c("EF" = "#1b7837", "MOTIVE" = "#762a83")) +
+  labs(
+    title    = "QSM Age Trajectories by Dataset",
+    subtitle = sprintf("Gold band = age overlap zone (%.0f-%.0f y)", overlap_lo, overlap_hi),
+    x = "Age (years)", y = "Susceptibility (ppm)", color = "Dataset"
+  ) +
+  theme(strip.background = element_blank(), legend.position = "bottom")
+```
+
+```{r sensitivity_overlap_test}
+# In the narrow overlap window, age range is too small for a smooth - use linear age.
+# Model: QSM ~ group * dataset + sex + age (linear)
+# Key terms: datasetMOTIVE (main effect) and study.groupPS:datasetMOTIVE (interaction)
+df_overlap_long <- df %>%
+  filter(age >= overlap_lo, age <= overlap_hi) %>%
+  pivot_longer(all_of(rois$primary), names_to = "ROI", values_to = "QSM")
+
+overlap_models <- df_overlap_long %>%
+  group_by(ROI) %>%
+  summarise(
+    model = list(tryCatch(
+      mgcv::gam(QSM ~ study.group * dataset + osex + age + s(subid, bs="re"),
+                method = "REML",
+                data = cur_data()),
+      error = function(e) NULL
+    )),
+    .groups = "drop"
+  ) %>%
+  filter(!map_lgl(model, is.null))
+
+overlap_results <- overlap_models %>%
+  mutate(tidy = map(model, ~ broom::tidy(.x, parametric = TRUE))) %>%
+  select(-model) %>%
+  unnest(tidy) %>%
+  filter(str_detect(term, "dataset")) %>%
+  group_by(term) %>%
+  mutate(p.fdr = p.adjust(p.value, "fdr")) %>%
+  ungroup() %>%
+  arrange(term, p.value)
+
+overlap_results %>%
+  present_results()
+```
+
+## Longitudinal Consistency
+
+```{r sensitivity_longitudinal_consistency}
+# Reliability (ICC + test-retest) is computed alongside the regional overview
+# figure above; here we present the standalone reliability outputs.
+icc_results %>%
+  kable(caption = "Intraclass Correlation Coefficients (ICC) for Longitudinal Data",
+        digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+# Striatal ROIs (as previously reported)
+test_retest_plot(rois$striatum,
+                 "Test-Retest Reliability - Striatum (Subjects with 2 Timepoints)")
+
+# All ROIs analyzed in the paper: primary set + whole-subcortex composite
+fig_icc_all <- test_retest_plot(
+  reliability_rois,
+  "Test-Retest Reliability - All Analyzed ROIs (Subjects with 2 Timepoints)",
+  ncol = 3)
+fig_icc_all
+save_fig(fig_icc_all, "suppfig_icc_test_retest", width = 11, height = 12)
+```
+
+# Medication Sensitivity {.tabset}
+
+Sensitivity analyses assessing whether psychotropic medication confounds or
+masks the primary findings. **Medications** are harmonized across EF + MOTIVE (curated EF
+data; shared psychotropic class flags), and - because they are endorsed almost exclusively by
+PS in both cohorts - are analyzed *within PS* on the combined sample (adjusting for cohort).
+All models are GAMMs of susceptibility on a smooth of age with a
+subject random intercept, mirroring the primary analyses. FDR is applied across ROIs within
+each predictor; effect sizes and CIs matter more than thresholds.
+
+```{r ms_sensitivity_prep, cache=TRUE, dependson="df_checkpoint"}
+# Combined-cohort long frame with harmonized subject-level medications (joined on bblid)
+df_med_ms <- df %>%
+  left_join(med_harmonized %>% select(-dataset), by = "bblid") %>%
+  pivot_longer(all_of(c(rois$primary, rois$global)),
+               names_to = "ROI", values_to = "QSM") %>%
+  filter(!is.na(QSM)) %>%
+  mutate(ROI = factor(ROI, levels = c(rois$primary, rois$global)))
+
+# Adjusted mean effect of a binary 0/1 predictor on QSM, per ROI. `covars` is the
+# (non-age) adjustment set, e.g. "osex + dataset" (combined meds) or "osex + study.group".
+qsm_pred_means <- function(data, predictor, covars = "osex") {
+  fml <- as.formula(sprintf("QSM ~ s(age, k=6) + %s + %s + s(subid, bs='re')",
+                            covars, predictor))
+  data %>%
+    filter(!is.na(.data[[predictor]])) %>%
+    group_by(ROI) %>%
+    summarise(
+      n_yes = sum(.data[[predictor]] == 1),
+      n_obs = n(),
+      model = list(tryCatch(mgcv::gam(fml, method = "REML", data = cur_data()),
+                            error = function(e) NULL)),
+      .groups = "drop"
+    ) %>%
+    filter(!map_lgl(model, is.null)) %>%
+    mutate(tidy = map(model, ~ broom::tidy(.x, parametric = TRUE) %>%
+                        filter(term == predictor))) %>%
+    select(ROI, n_yes, n_obs, tidy) %>%
+    unnest(tidy) %>%
+    mutate(Predictor = predictor,
+           p.fdr     = p.adjust(p.value, "fdr"),
+           ROI       = label_roi(as.character(ROI))) %>%
+    select(Predictor, ROI, n_yes, n_obs, estimate, std.error, statistic, p.value, p.fdr) %>%
+    arrange(p.value)
+}
+
+# Age x predictor moderation (ordered-factor difference smooth) for one ROI.
+qsm_pred_agemod <- function(data, predictor, roi = "Subcortex_Total", covars = "osex") {
+  d <- data %>%
+    filter(ROI == roi, !is.na(.data[[predictor]])) %>%
+    mutate(predf = ordered(.data[[predictor]], levels = c(0, 1)))
+  fml <- as.formula(sprintf(
+    "QSM ~ s(age, k=6) + s(age, by=predf, k=4) + %s + predf + s(subid, bs='re')", covars))
+  m <- tryCatch(mgcv::gam(fml, method = "REML", data = d), error = function(e) NULL)
+  if (is.null(m)) return(NULL)
+  broom::tidy(m, parametric = FALSE) %>%
+    filter(str_detect(term, "s\\(age\\):predf")) %>%
+    transmute(Predictor = predictor, ROI = label_roi(roi),
+              edf, statistic, p.value)
+}
+```
+
+## Medication Effects in PS (EF + MOTIVE)
+
+Do antidepressant/stimulant/any-psychotropic exposures relate to subcortical iron in PS, as
+a mean shift or by moderating the age trajectory? Estimated on the combined EF + MOTIVE PS
+sample (adjusting for age, sex, and cohort), which gives the largest available endorsement
+counts (stimulant ~ 30, antidepressant ~ 31, any-psychotropic ~ 54).
+
+```{r ms_meds_ps, cache=TRUE, dependson="ms_sensitivity_prep"}
+df_ps_ms  <- filter(df_med_ms, study.group == "PS")
+med_preds <- c("med_any_psych", "med_antidepressant", "med_stimulant")
+med_lab   <- c(med_any_psych = "Any psychotropic",
+               med_antidepressant = "Antidepressant", med_stimulant = "Stimulant")
+
+med_mean_results <- map_dfr(med_preds, ~ qsm_pred_means(df_ps_ms, .x, covars = "osex + dataset")) %>%
+  mutate(Predictor = med_lab[Predictor])
+save_table(med_mean_results, "supptable_meds_ps_meaneffect",
+           "Medication mean effect on QSM within PS, EF+MOTIVE (age/sex/cohort-adjusted)")
+cat("**Mean medication effect on QSM within PS (EF + MOTIVE; age/sex/cohort-adjusted):**\n")
+med_mean_results %>% present_results()
+
+# Age moderation by medication, whole-subcortex composite
+med_agemod <- map_dfr(med_preds, ~ qsm_pred_agemod(df_ps_ms, .x, covars = "osex + dataset")) %>%
+  mutate(Predictor = med_lab[Predictor], p.fdr = p.adjust(p.value, "fdr"))
+cat("\n**Age x medication moderation (Subcortex Total, PS, EF + MOTIVE):**\n")
+med_agemod %>% present_results()
+```
+
+## Effect on the PS-TD Group Difference
+
+Does adjusting for medications change the PS-TD susceptibility difference?
+Because meds are PS-only, adjusting for a medication contrasts *unmedicated PS vs TD* - if
+the gap grows, medication was masking it. Medication adjustment uses the full combined
+EF + MOTIVE sample.
+
+```{r ms_groupdiff_sensitivity, cache=TRUE, dependson="ms_sensitivity_prep"}
+# PS-TD coefficient per ROI under a base model and with one extra covariate added.
+groupPS_under <- function(data, cov = NULL, label) {
+  d   <- data
+  rhs <- "s(age, k=6) + osex + study.group + s(subid, bs='re')"
+  if (!is.null(cov)) {
+    d   <- d %>% filter(!is.na(.data[[cov]]))
+    rhs <- sprintf("s(age, k=6) + osex + study.group + %s + s(subid, bs='re')", cov)
+  }
+  d %>% group_by(ROI) %>%
+    summarise(model = list(tryCatch(mgcv::gam(as.formula(paste("QSM ~", rhs)),
+              method = "REML", data = cur_data()), error = function(e) NULL)),
+              .groups = "drop") %>%
+    filter(!map_lgl(model, is.null)) %>%
+    mutate(tidy = map(model, ~ broom::tidy(.x, parametric = TRUE) %>%
+                        filter(term == "study.groupPS"))) %>%
+    select(ROI, tidy) %>% unnest(tidy) %>%
+    transmute(ROI = label_roi(as.character(ROI)), Scenario = label,
+              PS_TD_est = estimate, se = std.error, p.value)
+}
+
+show_groupdiff <- function(tbl, cap) {
+  tbl %>%
+    mutate(PS_TD_est = round(PS_TD_est, 4)) %>%
+    select(ROI, Scenario, PS_TD_est) %>%
+    pivot_wider(names_from = Scenario, values_from = PS_TD_est) %>%
+    kbl(caption = cap) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+    scroll_box(width = "100%")
+}
+
+# (A) Medication adjustment - combined EF + MOTIVE sample
+groupdiff_meds <- bind_rows(
+  groupPS_under(df_med_ms, NULL,                 "Base (age + sex)"),
+  groupPS_under(df_med_ms, "med_antidepressant", "+ Antidepressant"),
+  groupPS_under(df_med_ms, "med_stimulant",      "+ Stimulant"),
+  groupPS_under(df_med_ms, "med_any_psych",      "+ Any psychotropic")
+) %>%
+  mutate(Scenario = factor(Scenario, levels = c(
+    "Base (age + sex)", "+ Antidepressant", "+ Stimulant", "+ Any psychotropic")))
+
+save_table(groupdiff_meds, "supptable_groupdiff_med_sensitivity",
+           "PS-TD QSM difference under medication adjustment (EF+MOTIVE)")
+
+cat("**Medication adjustment (combined EF + MOTIVE):**\n")
+show_groupdiff(groupdiff_meds, "PS-TD susceptibility difference by medication adjustment (EF + MOTIVE)")
+```
+
+## Iron Supplements
+
+Oral iron supplementation directly affects the outcome, making it the most important
+potential confound for a brain-iron study. It is captured from EF (curated records) and from
+MOTIVE (parsed from the free-text `dwmedlist`, where the binary class flags miss it). It is
+rare, so rather than model it we report prevalence and confirm that excluding iron-supplement
+users does not move the headline group difference.
+
+```{r ms_iron_supplement, cache=TRUE, dependson="ms_sensitivity_prep"}
+iron_ids <- med_harmonized %>% filter(iron_supplement == 1) %>% pull(bblid) %>% as.character()
+
+# Iron-supplement users present in the analysis sample (TD/PS), by cohort and group
+iron_users <- df %>%
+  distinct(subid, bblid, dataset, study.group) %>%
+  filter(as.character(bblid) %in% iron_ids)
+cat(sprintf("Iron-supplement users in the analysis sample: %d subjects\n",
+            n_distinct(iron_users$subid)))
+iron_users %>% count(dataset, study.group, name = "n") %>% present_results()
+
+# Robustness: whole-subcortex PS-TD difference, all subjects vs excluding iron users
+iron_robust <- map_dfr(c("All subjects", "Excluding iron-supplement users"), function(scn) {
+  d <- df_med_ms %>% filter(ROI == "Subcortex_Total")
+  if (scn != "All subjects") d <- d %>% filter(!(as.character(bblid) %in% iron_ids))
+  m <- mgcv::gam(QSM ~ s(age, k=6) + osex + study.group + s(subid, bs='re'),
+                 method = "REML", data = d)
+  broom::tidy(m, parametric = TRUE) %>% filter(term == "study.groupPS") %>%
+    transmute(Sample = scn, PS_TD_est = estimate, se = std.error, p.value)
+})
+cat("\n**PS-TD difference (Subcortex Total), with vs without iron-supplement users:**\n")
+iron_robust %>% present_results()
+```
+
+## Medication-Adjusted Primary Effects
+
+Psychotropic medication was largely a PS-only exposure and could in principle account for the
+group effects. As a direct sensitivity check we refit the two headline analyses - the age x group
+divergence in subcortical iron and the whole-subcortex iron-cognition association - adding any
+psychotropic exposure as a covariate. Participants without a medication record are treated as
+unexposed, so the covariate contrasts medicated participants against everyone else, asking whether
+the primary effects survive adjustment for it.
+
+```{r ms_medadj_primary, cache=TRUE, dependson="ms_sensitivity_prep"}
+# Treat a missing medication record as "no psychotropic" so that TD participants
+# (largely unmedicated, sometimes without a med pull) are retained in the contrast.
+df_medadj <- df_med_ms %>% mutate(anypsych01 = tidyr::replace_na(med_any_psych, 0L))
+
+## (A) Age x group divergence (difference smooth), unadjusted vs + any psychotropic ----
+fit_div <- function(data, add_med) {
+  rhs <- "s(age, k=6) + s(age, by=ostudy.group, k=4) + osex + ostudy.group + s(subid, bs='re')"
+  if (add_med) rhs <- paste(rhs, "+ anypsych01")
+  data %>% group_by(ROI) %>%
+    summarise(model = list(tryCatch(
+      mgcv::gam(as.formula(paste("QSM ~", rhs)), method = "REML", data = cur_data()),
+      error = function(e) NULL)), .groups = "drop") %>%
+    filter(!map_lgl(model, is.null)) %>%
+    mutate(tidy = map(model, ~ broom::tidy(.x, parametric = FALSE) %>%
+                        filter(term == "s(age):ostudy.groupPS"))) %>%
+    select(ROI, tidy) %>% unnest(tidy) %>%
+    transmute(ROI = label_roi(as.character(ROI)), edf, statistic, p.value)
+}
+
+div_medadj_cmp <- left_join(
+  fit_div(df_medadj, FALSE) %>% rename(F = statistic, p = p.value),
+  fit_div(df_medadj, TRUE)  %>% rename(edf_adj = edf, F_adj = statistic, p_adj = p.value),
+  by = "ROI") %>%
+  mutate(p.fdr = p.adjust(p_adj, "fdr")) %>%
+  arrange(p_adj)
+save_table(div_medadj_cmp, "supptable_medadj_agegroup",
+           "Age x group divergence in QSM: unadjusted vs medication-adjusted, any psychotropic (difference smooth)")
+cat("**Age x group divergence `s(age):groupPS`: unadjusted vs + any psychotropic (FDR on adjusted p)**\n")
+div_medadj_cmp %>% present_results()
+
+## (B) Whole-subcortex iron -> cognition, unadjusted vs + any psychotropic ------------
+df_cog_medadj <- df_medadj %>%
+  filter(ROI == "Subcortex_Total") %>%
+  pivot_longer(all_of(cog_measures$efficiency),
+               names_to = "Cog.Domain", values_to = "Cog.Score") %>%
+  filter(!is.na(Cog.Score))
+
+fit_cog <- function(data, add_med) {
+  rhs <- "s(age) + s(QSM) + osex + study.group + s(subid, bs='re')"
+  if (add_med) rhs <- paste(rhs, "+ anypsych01")
+  data %>% group_by(Cog.Domain) %>%
+    summarise(model = list(tryCatch(
+      mgcv::gam(as.formula(paste("Cog.Score ~", rhs)), method = "REML", data = cur_data()),
+      error = function(e) NULL)), .groups = "drop") %>%
+    filter(!map_lgl(model, is.null)) %>%
+    mutate(tidy = map(model, ~ broom::tidy(.x, parametric = FALSE) %>%
+                        filter(term == "s(QSM)"))) %>%
+    select(Cog.Domain, tidy) %>% unnest(tidy) %>%
+    transmute(Domain = label_cog(Cog.Domain), edf, statistic, p.value)
+}
+
+cog_medadj_cmp <- left_join(
+  fit_cog(df_cog_medadj, FALSE) %>% rename(F = statistic, p = p.value),
+  fit_cog(df_cog_medadj, TRUE)  %>% rename(edf_adj = edf, F_adj = statistic, p_adj = p.value),
+  by = "Domain") %>%
+  mutate(p.fdr = p.adjust(p_adj, "fdr"))
+save_table(cog_medadj_cmp, "supptable_medadj_qsm_cog",
+           "Whole-subcortex iron-cognition association: unadjusted vs medication-adjusted (any psychotropic)")
+cat("\n**Whole-subcortex iron -> cognition `s(QSM)` (Subcortex Total): unadjusted vs + any psychotropic**\n")
+cog_medadj_cmp %>% present_results()
+```
+
+The age-resolved PS - TD divergence curves (with simultaneous 95% CIs) make the
+robustness visual: for the whole-subcortex composite and the two ROIs with the
+strongest divergence (substantia nigra, pallidum), the unadjusted and
+medication-adjusted curves are nearly superimposed.
+
+```{r ms_medadj_divergence_fig, cache=TRUE, dependson="ms_sensitivity_prep", fig.width=11, fig.height=4}
+df_medadj  <- df_med_ms %>% mutate(anypsych01 = tidyr::replace_na(med_any_psych, 0L))
+fig_rois <- c("Subcortex_Total", "SN_Total", "Pallidum_Total")
+
+# Reconstruct the age-resolved PS - TD difference curve with a simultaneous 95% CI.
+# anypsych01 is a shared, non-age-varying term, so it cancels in the PS-minus-TD lpmatrix
+# difference; medication adjustment changes only the coefficients/vcov (i.e. the curve).
+divergence_curve <- function(data, roi, add_med, n_pts = 200, n_sim = 10000) {
+  d   <- data %>% filter(ROI == roi)
+  rhs <- "s(age, k=6) + s(age, by=ostudy.group, k=4) + osex + ostudy.group + s(subid, bs='re')"
+  if (add_med) rhs <- paste(rhs, "+ anypsych01")
+  mod <- mgcv::gam(as.formula(paste("QSM ~", rhs)), method = "REML", data = d)
+
+  age_range <- quantile(mod$model$age, c(0.01, 0.99))
+  age_seq   <- seq(age_range[1], age_range[2], length.out = n_pts)
+  glv       <- levels(mod$model$ostudy.group)
+  base      <- data.frame(age = age_seq, osex = mod$model$osex[1], subid = mod$model$subid[1])
+  if (add_med) base$anypsych01 <- 0L
+  nd_PS <- cbind(base, ostudy.group = ordered("PS", levels = glv))
+  nd_TD <- cbind(base, ostudy.group = ordered("TD", levels = glv))
+
+  Xp_diff <- predict(mod, nd_PS, type = "lpmatrix") - predict(mod, nd_TD, type = "lpmatrix")
+  beta <- coef(mod); Vp <- vcov(mod, unconditional = TRUE)
+  est  <- as.numeric(Xp_diff %*% beta)
+  se   <- sqrt(rowSums((Xp_diff %*% Vp) * Xp_diff))
+  sim0 <- MASS::mvrnorm(n_sim, mu = rep(0, length(beta)), Sigma = Vp)
+  crit <- quantile(apply(abs(sweep(Xp_diff %*% t(sim0), 1, se, "/")), 2, max), 0.95)
+
+  tibble(ROI = label_roi(roi), age = age_seq, est = est,
+         lower = est - crit * se, upper = est + crit * se,
+         Model = if (add_med) "Medication-adjusted" else "Unadjusted")
+}
+
+div_curves <- map_dfr(fig_rois, function(r)
+  bind_rows(divergence_curve(df_medadj, r, FALSE),
+            divergence_curve(df_medadj, r, TRUE))) %>%
+  mutate(ROI   = factor(ROI, levels = label_roi(fig_rois)),
+         Model = factor(Model, levels = c("Unadjusted", "Medication-adjusted")))
+
+p_medadj_div <- ggplot(div_curves, aes(age, est, color = Model, fill = Model)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.16, color = NA) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~ ROI, scales = "free_y") +
+  scale_color_manual(values = c("Unadjusted" = "black", "Medication-adjusted" = "#E69F00")) +
+  scale_fill_manual(values  = c("Unadjusted" = "black", "Medication-adjusted" = "#E69F00")) +
+  labs(title = "PS - TD divergence in subcortical iron, with and without medication adjustment",
+       subtitle = "GAMM difference smooth (PS - TD) +/- simultaneous 95% CI; overlapping curves indicate robustness to psychotropic exposure",
+       x = "Age (years)", y = "PS - TD susceptibility (ppm)", color = NULL, fill = NULL) +
+  theme(legend.position = "bottom", strip.background = element_blank())
+p_medadj_div
+save_fig(p_medadj_div, "suppfig_medadj_divergence", width = 11, height = 4)
+```
+
+## Visualizations
+
+Visual summaries of the medication associations.
+
+```{r ms_med_forest, fig.width=11, fig.height=5}
+# Medication associations with iron, within PS: GAMM beta +/- 95% CI per ROI
+roi_lvls <- rev(label_roi(c(rois$primary, rois$global)))
+p_med_forest <- med_mean_results %>%
+  filter(Predictor %in% c("Stimulant", "Antidepressant", "Any psychotropic")) %>%
+  mutate(ROI       = factor(ROI, levels = roi_lvls),
+         Predictor = factor(Predictor,
+                            levels = c("Stimulant", "Antidepressant", "Any psychotropic"))) %>%
+  ggplot(aes(x = estimate, y = ROI)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_pointrange(aes(xmin = estimate - 1.96 * std.error,
+                      xmax = estimate + 1.96 * std.error),
+                  color = "grey20", linewidth = 0.6) +
+  facet_wrap(~ Predictor) +
+  labs(title = "Medication associations with subcortical iron (within PS, EF + MOTIVE)",
+       subtitle = "GAMM β +/- 95% CI, adjusted for age, sex, and cohort; positive = higher susceptibility (more iron)",
+       x = "delta Susceptibility (ppm): medicated - unmedicated", y = NULL) +
+  theme(strip.background = element_blank())
+p_med_forest
+save_fig(p_med_forest, "suppfig_meds_ps_forest", width = 11, height = 5)
+```
+
+# Save Results
+
+```{r save_results, eval=FALSE}
+dir.create("Results", showWarnings = FALSE)
+
+# Subset of results objects retained through the analysis pipeline
+results_list <- list(
+  age_main          = age_main_results,
+  group_diff_tdps   = group_diff_tdps_results,
+  qsm_cog_main      = qsm_cog_main_results,
+  qsm_cog_bygroup   = qsm_cog_bygroup_results,
+  dataset_effects   = dataset_results,
+  icc               = icc_results
+)
+
+saveRDS(results_list, "Results/all_analysis_results.rds")
+write_delim(df, "Results/master_df_clean.txt", delim = ";")
+```
+
