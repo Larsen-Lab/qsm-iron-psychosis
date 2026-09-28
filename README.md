@@ -1,4 +1,4 @@
-# Subcortical brain iron development in psychosis-spectrum youth
+# Subcortical brain iron development in youth with and without psychosis-spectrum symptoms
 
 Analysis code and de-identified data for Larsen et al. (in preparation), examining the
 developmental trajectory of subcortical magnetic susceptibility — an MRI marker of brain iron
